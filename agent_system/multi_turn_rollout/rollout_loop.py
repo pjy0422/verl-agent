@@ -87,20 +87,29 @@ class TrajectoryCollector:
         )
 
         # Build chat structure
-        obs_content = ""
-        if obs_text is not None:
-            obs_content += obs_text
+        if (
+            isinstance(obs_text, list)
+            and len(obs_text) > 0
+            and isinstance(obs_text[0], dict)
+        ):
+            # Environment provided a full chat structure (e.g., system + user roles)
+            chat = np.array(obs_text)
         else:
-            print(f"Warning: No text observation found!")
+            # Fallback for old environments: wrap string in a user role
+            obs_content = ""
+            if obs_text is not None:
+                obs_content += str(obs_text)
+            else:
+                print(f"Warning: No text observation found!")
 
-        chat = np.array(
-            [
-                {
-                    "content": obs_content,
-                    "role": "user",
-                }
-            ]
-        )
+            chat = np.array(
+                [
+                    {
+                        "content": obs_content,
+                        "role": "user",
+                    }
+                ]
+            )
 
         # Apply chat template
         prompt_with_chat_template = self.tokenizer.apply_chat_template(
@@ -119,9 +128,7 @@ class TrajectoryCollector:
             raw_prompt = prompt_with_chat_template.replace(
                 "<image>", "<|vision_start|><|image_pad|><|vision_end|>"
             )
-            row_dict["multi_modal_data"] = {
-                "image": [process_image(obs_image)]
-            }
+            row_dict["multi_modal_data"] = {"image": [process_image(obs_image)]}
             image_inputs = self.processor.image_processor(
                 row_dict["multi_modal_data"]["image"], return_tensors="pt"
             )
@@ -133,15 +140,13 @@ class TrajectoryCollector:
                 merge_length = self.processor.image_processor.merge_size**2
                 index = 0
                 while "<image>" in prompt_with_chat_template:
-                    prompt_with_chat_template = (
-                        prompt_with_chat_template.replace(
-                            "<image>",
-                            "<|vision_start|>"
-                            + "<|placeholder|>"
-                            * (image_grid_thw[index].prod() // merge_length)
-                            + "<|vision_end|>",
-                            1,
-                        )
+                    prompt_with_chat_template = prompt_with_chat_template.replace(
+                        "<image>",
+                        "<|vision_start|>"
+                        + "<|placeholder|>"
+                        * (image_grid_thw[index].prod() // merge_length)
+                        + "<|vision_end|>",
+                        1,
                     )
                     index += 1
 
@@ -175,30 +180,20 @@ class TrajectoryCollector:
                 attention_mask=attention_mask[0],
             )  # (3, seq_length)
             valid_mask = attention_mask[0].bool()
-            text_position_ids = torch.ones(
-                (1, len(input_ids[0])), dtype=torch.long
-            )
-            text_position_ids[0, valid_mask] = torch.arange(
-                valid_mask.sum().item()
-            )
+            text_position_ids = torch.ones((1, len(input_ids[0])), dtype=torch.long)
+            text_position_ids[0, valid_mask] = torch.arange(valid_mask.sum().item())
             position_ids = [
                 torch.cat((text_position_ids, vision_position_ids), dim=0)
             ]  # (1, 4, seq_length)
         else:
             position_ids = compute_position_id_with_mask(attention_mask)
 
-        raw_prompt_ids = self.tokenizer.encode(
-            raw_prompt, add_special_tokens=False
-        )
+        raw_prompt_ids = self.tokenizer.encode(raw_prompt, add_special_tokens=False)
         if len(raw_prompt_ids) > self.config.data.max_prompt_length:
             if self.config.data.truncation == "left":
-                raw_prompt_ids = raw_prompt_ids[
-                    -self.config.data.max_prompt_length :
-                ]
+                raw_prompt_ids = raw_prompt_ids[-self.config.data.max_prompt_length :]
             elif self.config.data.truncation == "right":
-                raw_prompt_ids = raw_prompt_ids[
-                    : self.config.data.max_prompt_length
-                ]
+                raw_prompt_ids = raw_prompt_ids[: self.config.data.max_prompt_length]
             elif self.config.data.truncation == "middle":
                 left_half = self.config.data.max_prompt_length // 2
                 right_half = self.config.data.max_prompt_length - left_half
@@ -318,12 +313,8 @@ class TrajectoryCollector:
                     # tool_callings
                     data["tool_callings"] = tool_callings[bs]
                     # per-turn data (trajectory-level, shared across all steps of same env)
-                    data["turn_rewards"] = np.array(
-                        turn_rewards_all[bs], dtype=object
-                    )
-                    data["turn_texts"] = np.array(
-                        turn_texts_all[bs], dtype=object
-                    )
+                    data["turn_rewards"] = np.array(turn_rewards_all[bs], dtype=object)
+                    data["turn_texts"] = np.array(turn_texts_all[bs], dtype=object)
                     data["turn_token_mask"] = np.array(
                         turn_token_mask_all[bs], dtype=object
                     )
@@ -334,9 +325,7 @@ class TrajectoryCollector:
                     effective_batch.append(data)
 
         # Convert trajectory data to DataProto format
-        gen_batch_output = DataProto.from_single_dict(
-            data=collate_fn(effective_batch)
-        )
+        gen_batch_output = DataProto.from_single_dict(data=collate_fn(effective_batch))
         return gen_batch_output
 
     def vanilla_multi_turn_loop(
@@ -371,9 +360,7 @@ class TrajectoryCollector:
             kwargs=gen_batch.non_tensor_batch.pop("env_kwargs", None)
         )
 
-        lenght_obs = (
-            len(obs["text"]) if obs["text"] is not None else len(obs["image"])
-        )
+        lenght_obs = len(obs["text"]) if obs["text"] is not None else len(obs["image"])
         assert (
             len(gen_batch.batch) == lenght_obs
         ), f"gen_batch size {len(gen_batch.batch)} does not match obs size {lenght_obs}"
@@ -409,6 +396,16 @@ class TrajectoryCollector:
         for _step in range(self.config.env.max_steps):
             active_masks = np.logical_not(is_done)
 
+            # ===== Debug Print (Obs) =====
+            print(f"\n====================================")
+            print(f"🚀 [Turn {_step}] PRE-PROCESS BATCH")
+            print(f"====================================")
+            try:
+                if obs and "text" in obs and obs["text"]:
+                    print(f"Env Obs[0]:\n{obs['text'][0]}\n")
+            except Exception as e:
+                print(f"Print Error: {e}")
+
             batch = self.preprocess_batch(gen_batch=gen_batch, obs=obs)
 
             batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
@@ -434,9 +431,7 @@ class TrajectoryCollector:
                 batch_input_padded
             )
             # # unpad
-            batch_output = unpad_dataproto(
-                batch_output_padded, pad_size=pad_size
-            )
+            batch_output = unpad_dataproto(batch_output_padded, pad_size=pad_size)
 
             batch.non_tensor_batch["uid"] = uid_batch
             batch.non_tensor_batch["traj_uid"] = traj_uid
@@ -447,7 +442,27 @@ class TrajectoryCollector:
                 batch.batch["responses"], skip_special_tokens=True
             )
 
+            # ===== Debug Print (Action) =====
+            print(f"====================================")
+            print(f"🎯 [Turn {_step}] ACTOR GENERATED ACTION")
+            print(f"====================================")
+            try:
+                print(f"Actor Action[0]:\n{text_actions[0]}\n")
+            except Exception as e:
+                print(f"Print Error: {e}")
+
             next_obs, rewards, dones, infos = envs.step(text_actions)
+
+            # ===== Debug Print (Step Result) =====
+            print(f"====================================")
+            print(f"📥 [Turn {_step}] ENV STEP RESULT")
+            print(f"====================================")
+            try:
+                print(f"Reward = {rewards if len(rewards) > 0 else 'N/A'}")
+                print(f"Dones = {dones}")
+                print(f"Is Done All? {np.logical_or(is_done, dones).all()}")
+            except Exception as e:
+                print(f"Print Error: {e}")
 
             if len(rewards.shape) == 2:
                 rewards = rewards.squeeze(1)
@@ -469,26 +484,20 @@ class TrajectoryCollector:
                     [info["tool_calling"] for info in infos], dtype=np.float32
                 )[active_masks]
             # Create reward tensor, only assign rewards for active environments
-            episode_rewards[active_masks] += torch_to_numpy(rewards)[
-                active_masks
-            ]
+            episode_rewards[active_masks] += torch_to_numpy(rewards)[active_masks]
             episode_lengths[active_masks] += 1
 
             assert (
                 len(rewards) == batch_size
             ), f"env should return rewards for all environments, got {len(rewards)} rewards for {batch_size} environments"
-            batch.non_tensor_batch["rewards"] = torch_to_numpy(
-                rewards, is_object=True
-            )
+            batch.non_tensor_batch["rewards"] = torch_to_numpy(rewards, is_object=True)
             batch.non_tensor_batch["active_masks"] = torch_to_numpy(
                 active_masks, is_object=True
             )
 
             # ===== Collect per-turn data (NEW) =====
             rewards_np = torch_to_numpy(rewards)
-            responses_tensor = batch.batch[
-                "responses"
-            ]  # (batch_size, seq_len)
+            responses_tensor = batch.batch["responses"]  # (batch_size, seq_len)
             for i in range(batch_size):
                 if active_masks[i]:
                     # Per-turn reward: r(i, t)
@@ -502,9 +511,7 @@ class TrajectoryCollector:
                     # Non-pad token count (pad_token_id tokens are padding)
                     if self.tokenizer.pad_token_id is not None:
                         n_tokens = int(
-                            (resp_ids != self.tokenizer.pad_token_id)
-                            .sum()
-                            .item()
+                            (resp_ids != self.tokenizer.pad_token_id).sum().item()
                         )
                     else:
                         # Fallback: count non-zero tokens
@@ -679,9 +686,7 @@ class TrajectoryCollector:
         total_episode_rewards = np.concatenate(total_episode_rewards, axis=0)
         total_episode_lengths = np.concatenate(total_episode_lengths, axis=0)
         total_success = {
-            key: np.concatenate(
-                [success[key] for success in total_success], axis=0
-            )
+            key: np.concatenate([success[key] for success in total_success], axis=0)
             for key in total_success[0].keys()
         }
         total_traj_uid = np.concatenate(total_traj_uid, axis=0)

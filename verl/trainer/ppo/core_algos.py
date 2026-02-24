@@ -105,9 +105,7 @@ def compute_gae_advantage_return(
 
         for t in reversed(range(gen_len)):
             nextvalues = values[:, t + 1] if t < gen_len - 1 else 0.0
-            delta = (
-                token_level_rewards[:, t] + gamma * nextvalues - values[:, t]
-            )
+            delta = token_level_rewards[:, t] + gamma * nextvalues - values[:, t]
             lastgaelam = delta + gamma * lam * lastgaelam
             advantages_reversed.append(lastgaelam)
         advantages = torch.stack(advantages_reversed[::-1], dim=1)
@@ -290,7 +288,7 @@ def compute_multiturn_grpo_advantage(
         # Apply response_mask to zero out padded areas
         token_advantages = token_advantages * response_mask
 
-    return token_advantages, token_advantages
+    return token_advantages, token_advantages, A_tilde
 
 
 def compute_grpo_passk_outcome_advantage(
@@ -404,9 +402,7 @@ def compute_reinforce_plus_plus_baseline_outcome_advantage(
         for i in range(bsz):
             scores[i] = scores[i] - id2mean[index[i]]
 
-        scores = (
-            scores.unsqueeze(-1).tile([1, response_length]) * response_mask
-        )
+        scores = scores.unsqueeze(-1).tile([1, response_length]) * response_mask
         scores = verl_F.masked_whiten(scores, response_mask) * response_mask
 
     return scores, scores
@@ -457,9 +453,9 @@ def compute_rloo_outcome_advantage(
         for i in range(bsz):
             response_num = len(id2score[index[i]])
             if response_num > 1:
-                scores[i] = scores[i] * response_num / (
-                    response_num - 1
-                ) - id2mean[index[i]] * response_num / (response_num - 1)
+                scores[i] = scores[i] * response_num / (response_num - 1) - id2mean[
+                    index[i]
+                ] * response_num / (response_num - 1)
         scores = scores.unsqueeze(-1) * response_mask
 
     return scores, scores
@@ -544,9 +540,7 @@ def compute_rewards(token_level_scores, old_log_prob, ref_log_prob, kl_ratio):
     return token_level_scores - kl * kl_ratio
 
 
-def agg_loss(
-    loss_mat: torch.Tensor, loss_mask: torch.Tensor, loss_agg_mode: str
-):
+def agg_loss(loss_mat: torch.Tensor, loss_mask: torch.Tensor, loss_agg_mode: str):
     """
     Aggregate the loss matrix into a scalar.
 
@@ -716,9 +710,7 @@ def compute_policy_loss_gspo(
     # s_i,t(θ) = sg[s_i(θ)] · π_θ(y_i,t|x, y_i,<t) / sg[π_θ(y_i,t|x, y_i,<t)]
     # In log space: log(s_i,t(θ)) = sg[log(s_i(θ))] + log_prob - sg[log_prob]
     log_seq_importance_ratio = (
-        log_prob
-        - log_prob.detach()
-        + negative_approx_kl_seq.detach().unsqueeze(-1)
+        log_prob - log_prob.detach() + negative_approx_kl_seq.detach().unsqueeze(-1)
     )
     log_seq_importance_ratio = torch.clamp(
         log_seq_importance_ratio, max=10.0
@@ -751,9 +743,7 @@ def compute_policy_loss_gspo(
     return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
 
 
-def compute_entropy_loss(
-    logits, response_mask, loss_agg_mode: str = "token-mean"
-):
+def compute_entropy_loss(logits, response_mask, loss_agg_mode: str = "token-mean"):
     """Compute categorical entropy loss (For backward compatibility)
 
     Args:
@@ -914,9 +904,7 @@ def compute_pf_ppo_reweight_data(
         if isinstance(array, np.ndarray):
             resampled_non_tensor_batch[key] = array[sample_indices_np]
         else:
-            resampled_non_tensor_batch[key] = [
-                array[i] for i in sample_indices_np
-            ]
+            resampled_non_tensor_batch[key] = [array[i] for i in sample_indices_np]
 
     resampled_meta_info = {}
     for key, value in data.meta_info.items():
