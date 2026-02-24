@@ -143,8 +143,10 @@ class _SingleConvEnv:
         reward = guard_result["safety_unsafe_prob"]
 
         # --- 5. Done check ---
+        # IMPORTANT: Always return done=False until we reach max_turns
+        # This ensures all episodes run exactly max_turns steps for GRPO
         # done = self.turn >= self.max_turns or reward > 0.5  # removed reward > 0.5 early stop
-        done = self.turn >= self.max_turns
+        done = (self.turn >= self.max_turns)
 
         info = {
             "turn": self.turn,

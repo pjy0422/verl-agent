@@ -499,24 +499,25 @@ class TrajectoryCollector:
             rewards_np = torch_to_numpy(rewards)
             responses_tensor = batch.batch["responses"]  # (batch_size, seq_len)
             for i in range(batch_size):
-                if active_masks[i]:
-                    # Per-turn reward: r(i, t)
-                    turn_rewards_all[i].append(float(rewards_np[i]))
+                # IMPORTANT: Collect turn data for ALL envs regardless of done status
+                # This ensures uniform turn_rewards length across all episodes
+                # Per-turn reward: r(i, t)
+                turn_rewards_all[i].append(float(rewards_np[i]))
 
-                    # Per-turn response text
-                    turn_texts_all[i].append(text_actions[i])
+                # Per-turn response text
+                turn_texts_all[i].append(text_actions[i])
 
-                    # Per-token turn index: count non-pad tokens in this response
-                    resp_ids = responses_tensor[i]
-                    # Non-pad token count (pad_token_id tokens are padding)
-                    if self.tokenizer.pad_token_id is not None:
-                        n_tokens = int(
-                            (resp_ids != self.tokenizer.pad_token_id).sum().item()
-                        )
-                    else:
-                        # Fallback: count non-zero tokens
-                        n_tokens = int((resp_ids != 0).sum().item())
-                    turn_token_mask_all[i].extend([_step] * n_tokens)
+                # Per-token turn index: count non-pad tokens in this response
+                resp_ids = responses_tensor[i]
+                # Non-pad token count (pad_token_id tokens are padding)
+                if self.tokenizer.pad_token_id is not None:
+                    n_tokens = int(
+                        (resp_ids != self.tokenizer.pad_token_id).sum().item()
+                    )
+                else:
+                    # Fallback: count non-zero tokens
+                    n_tokens = int((resp_ids != 0).sum().item())
+                turn_token_mask_all[i].extend([_step] * n_tokens)
 
             # ===== Verification print (NEW) =====
             if _step == 0:
@@ -540,9 +541,11 @@ class TrajectoryCollector:
             # Update observations for next step
             obs = next_obs
 
+            # NOTE: Do NOT break early for multiturn_conv env!
+            # We need all episodes to run exactly max_steps for uniform turn_rewards length
             # Break if all environments are done
-            if is_done.all():
-                break
+            # if is_done.all():
+            #     break
 
         # ===== Final verification print (NEW) =====
         for i in range(min(3, batch_size)):
