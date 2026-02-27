@@ -404,12 +404,13 @@ class MultiTurnConvEnv(gym.Env):
         # Run all steps asynchronously
         async def _run_all():
             tasks = []
-            for env, action in zip(self.envs, padded_actions):
-                if action:
-                    tasks.append(env.step_async(action))
-                else:
-                    # Dummy result for padded envs
+            for env, action, is_valid in zip(self.envs, padded_actions, valid_mask):
+                if not is_valid:
+                    # Truly padded env (beyond actual batch) → dummy
                     tasks.append(self._dummy_step())
+                else:
+                    # Real env: always step, even with empty/fallback action
+                    tasks.append(env.step_async(action or "Continue the conversation."))
             return await asyncio.gather(*tasks)
 
         results = self._loop.run_until_complete(_run_all())

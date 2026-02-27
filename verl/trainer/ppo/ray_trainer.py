@@ -304,6 +304,180 @@ def compute_response_mask(data: DataProto):
     return attention_mask[:, -response_length:]
 
 
+def _validate_multiturn_grpo_advantage(data, gamma, lambda_div, norm_adv_by_std_in_grpo):
+    """Hook 1: Independent re-computation of multi-turn GRPO advantages.
+
+    Re-implements the same logic as core_algos.compute_multiturn_grpo_advantage()
+    and compares results against data.batch["advantages"] and
+    data.non_tensor_batch["turn_advantages"].
+    Raises AssertionError on any mismatch.
+    """
+    epsilon = 1e-8
+
+    turn_rewards = data.non_tensor_batch["turn_rewards"].tolist()
+    turn_token_mask = data.non_tensor_batch["turn_token_mask"].tolist()
+    step_index_list = data.non_tensor_batch["step_index"].tolist()
+    index = data.non_tensor_batch["uid"]
+    traj_index = data.non_tensor_batch["traj_uid"]
+    bsz = len(turn_rewards)
+
+    grpo_mask = data.batch["response_mask"]
+    if "loss_mask" in data.batch:
+        response_length = grpo_mask.size(1)
+        grpo_mask = data.batch["loss_mask"][:, -response_length:]
+
+    # Step 1: r_hat (diversity augmentation)
+    r_hat = []
+    for i in range(bsz):
+        r_hat_i = []
+        for t in range(len(turn_rewards[i])):
+            div_bonus = 0.0 if lambda_div == 0 else 1.0
+            r_hat_i.append(turn_rewards[i][t] + lambda_div * div_bonus)
+        r_hat.append(r_hat_i)
+
+    # Step 2: (uid, traj_uid) dedup → flat mean/std → normalize A[i]
+    id2rhat = defaultdict(list)
+    seen_pairs = set()
+    for i in range(bsz):
+        idx = index[i]
+        pair = (idx, traj_index[i])
+        if pair in seen_pairs:
+            continue
+        seen_pairs.add(pair)
+        id2rhat[idx].extend(r_hat[i])
+
+    id2mean = {}
+    id2std = {}
+    for idx in id2rhat:
+        flat = id2rhat[idx]
+        if len(flat) <= 1:
+            id2mean[idx] = 0.0
+            id2std[idx] = 1.0
+        else:
+            ft = torch.tensor(flat, dtype=torch.float32)
+            id2mean[idx] = ft.mean().item()
+            id2std[idx] = ft.std().item()
+
+    A = []
+    for i in range(bsz):
+        idx = index[i]
+        mean_R = id2mean[idx]
+        std_R = id2std[idx] + epsilon if norm_adv_by_std_in_grpo else 1.0
+        if norm_adv_by_std_in_grpo:
+            A_i = [(r - mean_R) / std_R for r in r_hat[i]]
+        else:
+            A_i = [(r - mean_R) for r in r_hat[i]]
+        A.append(A_i)
+
+    # Step 3: backward pass A_tilde[t] = A[t] + gamma * A_tilde[t+1]
+    A_tilde = []
+    for i in range(bsz):
+        T = len(A[i])
+        if T == 0:
+            A_tilde.append([])
+            continue
+        at = [0.0] * T
+        at[-1] = A[i][-1]
+        for t in reversed(range(T - 1)):
+            at[t] = A[i][t] + gamma * at[t + 1]
+        A_tilde.append(at)
+
+    # Step 4: step_index → token mapping + grpo_mask
+    max_tokens = grpo_mask.shape[1]
+    recomputed = torch.zeros((bsz, max_tokens), dtype=torch.float32, device=grpo_mask.device)
+    for i in range(bsz):
+        step_idx = int(step_index_list[i])
+        if step_idx < len(A_tilde[i]):
+            recomputed[i, :] = A_tilde[i][step_idx]
+    recomputed = recomputed * grpo_mask
+
+    # Compare token-level advantages
+    actual_adv = data.batch["advantages"]
+    if not torch.allclose(recomputed, actual_adv, atol=1e-5, rtol=1e-4):
+        mismatch = ~torch.isclose(recomputed, actual_adv, atol=1e-5, rtol=1e-4)
+        rows, cols = torch.where(mismatch)
+        n_mismatch = rows.numel()
+        diag_lines = [f"[HOOK 1] FAILED: {n_mismatch} mismatched positions"]
+        for k in range(min(10, n_mismatch)):
+            r, c = rows[k].item(), cols[k].item()
+            diag_lines.append(
+                f"  row={r}, col={c}: recomputed={recomputed[r, c].item():.6f}, "
+                f"actual={actual_adv[r, c].item():.6f}, "
+                f"raw_rewards={turn_rewards[r]}, A_tilde={A_tilde[r]}, "
+                f"group_mean={id2mean[index[r]]:.6f}, group_std={id2std[index[r]]:.6f}"
+            )
+        raise AssertionError("\n".join(diag_lines))
+
+    # Compare turn-level advantages
+    actual_turn_adv = data.non_tensor_batch["turn_advantages"]
+    for i in range(bsz):
+        for t in range(len(A_tilde[i])):
+            if abs(A_tilde[i][t] - actual_turn_adv[i][t]) > 1e-5:
+                raise AssertionError(
+                    f"[HOOK 1] FAILED: turn_advantages mismatch at row={i}, turn={t}: "
+                    f"recomputed={A_tilde[i][t]:.6f}, actual={actual_turn_adv[i][t]:.6f}"
+                )
+
+    # Verify mask: grpo_mask==0 → advantage==0
+    zero_mask = grpo_mask == 0
+    if (actual_adv[zero_mask] != 0).any():
+        bad = torch.where(zero_mask & (actual_adv != 0))
+        raise AssertionError(
+            f"[HOOK 1] FAILED: {bad[0].numel()} positions have non-zero advantage where grpo_mask==0"
+        )
+
+    print("[HOOK 1] PASSED: Multi-turn GRPO advantage independent re-computation matches.")
+
+
+def _validate_advantages_before_actor(data):
+    """Hook 2: Validate advantage data integrity before actor update.
+
+    Checks for NaN/Inf, loss_mask consistency, and non-zero advantage ratio.
+    Raises AssertionError on critical issues.
+    """
+    advantages = data.batch["advantages"]
+
+    # Check NaN/Inf
+    if torch.isnan(advantages).any():
+        nan_count = torch.isnan(advantages).sum().item()
+        raise AssertionError(f"[HOOK 2] FAILED: advantages contain {nan_count} NaN values")
+    if torch.isinf(advantages).any():
+        inf_count = torch.isinf(advantages).sum().item()
+        raise AssertionError(f"[HOOK 2] FAILED: advantages contain {inf_count} Inf values")
+
+    # Check loss_mask==0 → advantage==0
+    if "loss_mask" in data.batch:
+        response_length = advantages.shape[1]
+        loss_mask = data.batch["loss_mask"][:, -response_length:]
+        zero_mask = loss_mask == 0
+        violations = (advantages[zero_mask] != 0).sum().item()
+        if violations > 0:
+            raise AssertionError(
+                f"[HOOK 2] FAILED: {violations} positions have non-zero advantage where loss_mask==0"
+            )
+
+        # Check non-zero advantage ratio among active tokens
+        active_tokens = (loss_mask == 1).sum().item()
+        if active_tokens > 0:
+            nonzero_active = ((loss_mask == 1) & (advantages != 0)).sum().item()
+            ratio = nonzero_active / active_tokens
+            if ratio < 0.01:
+                import warnings
+                warnings.warn(
+                    f"[HOOK 2] WARNING: Only {ratio*100:.2f}% of active tokens have non-zero advantage "
+                    f"({nonzero_active}/{active_tokens}). This may indicate a bug."
+                )
+
+    # Shape consistency
+    if "response_mask" in data.batch:
+        assert advantages.shape == data.batch["response_mask"].shape, (
+            f"[HOOK 2] FAILED: advantages shape {advantages.shape} != "
+            f"response_mask shape {data.batch['response_mask'].shape}"
+        )
+
+    print("[HOOK 2] PASSED: Advantages data integrity verified before actor update.")
+
+
 def compute_advantage(
     data: DataProto,
     adv_estimator,
@@ -1623,6 +1797,18 @@ class RayPPOTrainer:
                             lambda_div=self.config.algorithm.get("lambda_div", 0.1),
                         )
 
+                        # Hook 1: Validate multi-turn GRPO advantage via independent re-computation
+                        if (
+                            self.config.trainer.get("debug_validate_pipeline", False)
+                            and self.config.algorithm.adv_estimator == "multiturn_grpo"
+                        ):
+                            _validate_multiturn_grpo_advantage(
+                                data=batch,
+                                gamma=self.config.algorithm.gamma,
+                                lambda_div=self.config.algorithm.get("lambda_div", 0.1),
+                                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                            )
+
                     # update critic
                     if self.use_critic:
                         with _timer("update_critic", timing_raw):
@@ -1634,10 +1820,17 @@ class RayPPOTrainer:
 
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
+                        # Hook 2: Validate advantages before actor update
+                        if self.config.trainer.get("debug_validate_pipeline", False):
+                            _validate_advantages_before_actor(batch)
+
                         # update actor
                         with _timer("update_actor", timing_raw):
                             batch.meta_info["multi_turn"] = (
                                 self.config.actor_rollout_ref.rollout.multi_turn.enable
+                            )
+                            batch.meta_info["debug_validate_pipeline"] = (
+                                self.config.trainer.get("debug_validate_pipeline", False)
                             )
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(

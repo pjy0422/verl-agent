@@ -39,6 +39,47 @@ from verl.utils.torch_functional import logprobs_from_logits
 from verl.utils.ulysses import gather_outpus_and_unpad, ulysses_pad_and_slice_inputs, ulysses_pad
 from verl.workers.actor import BasePPOActor
 
+
+def _validate_actor_masks(data, response_mask, response_length, multi_turn):
+    """Hook 3: Validate mask consistency inside actor micro-batch.
+
+    Checks that response_mask uses loss_mask (not attention_mask) in multi-turn,
+    that shapes are consistent, and that masked positions have zero advantage.
+    Raises AssertionError on any critical violation.
+    """
+    # Check 1: multi_turn → response_mask == loss_mask[:, -response_length:]
+    if multi_turn:
+        if "loss_mask" not in data:
+            raise AssertionError("[HOOK 3] FAILED: loss_mask key missing in data for multi_turn=True")
+        expected_mask = data["loss_mask"][:, -response_length:]
+        if not torch.equal(response_mask, expected_mask):
+            mismatch = (response_mask != expected_mask).sum().item()
+            raise AssertionError(
+                f"[HOOK 3] FAILED: response_mask != loss_mask[:, -{response_length}:] "
+                f"({mismatch} mismatched positions). "
+                f"Ensure multi_turn uses loss_mask, not attention_mask."
+            )
+
+    # Check 2: advantages.shape == response_mask.shape
+    advantages = data["advantages"]
+    if advantages.shape != response_mask.shape:
+        raise AssertionError(
+            f"[HOOK 3] FAILED: advantages shape {advantages.shape} != "
+            f"response_mask shape {response_mask.shape}"
+        )
+
+    # Check 3: response_mask==0 → advantage==0
+    zero_mask = response_mask == 0
+    violations = (advantages[zero_mask] != 0).sum().item()
+    if violations > 0:
+        raise AssertionError(
+            f"[HOOK 3] FAILED: {violations} positions have non-zero advantage "
+            f"where response_mask==0"
+        )
+
+    print("[HOOK 3] PASSED: Actor mask consistency verified.")
+
+
 if is_cuda_available:
     from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
 elif is_npu_available:
@@ -320,6 +361,7 @@ class DataParallelPPOActor(BasePPOActor):
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
         multi_turn = data.meta_info.get("multi_turn", False)
+        debug_validate_pipeline = data.meta_info.get("debug_validate_pipeline", False)
 
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages"]
         if multi_turn:
@@ -370,6 +412,10 @@ class DataParallelPPOActor(BasePPOActor):
                         response_mask = data["loss_mask"][:, -response_length:]
                     else:
                         response_mask = attention_mask[:, -response_length:]
+
+                    # Hook 3: Validate actor masks
+                    if debug_validate_pipeline:
+                        _validate_actor_masks(data, response_mask, response_length, multi_turn)
 
                     old_log_prob = data["old_log_probs"]
                     advantages = data["advantages"]

@@ -291,6 +291,7 @@ trainer:
   max_critic_ckpt_to_keep: null
   ray_wait_register_center_timeout: 300
   device: cuda
+  debug_validate_pipeline: false
 
 # Ray initialization
 ray_init:

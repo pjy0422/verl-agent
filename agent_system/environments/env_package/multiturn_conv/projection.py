@@ -61,16 +61,118 @@ def parse_json_response(text: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _extract_prompt_value_raw(text: str) -> Optional[str]:
+    """
+    Regex-extract the value after a "prompt" key from malformed JSON or markdown.
+
+    Handles:
+      JSON malformed:  {"rationale": "abc", "prompt": ewmviwemiv}
+      JSON truncated:  {"rationale": "abc", "prompt": "some text that got cut off...
+      Markdown bold:   **prompt**: actual attack text here
+      Markdown header: ## Prompt\nthe content
+    """
+    # --- JSON-style: "prompt" : value ---
+    m = re.search(r'"prompt"\s*:\s*', text)
+    if m:
+        rest = text[m.end():]
+
+        # Case 1: quoted value (possibly unterminated)
+        if rest.startswith('"'):
+            qm = re.match(r'"((?:[^"\\]|\\.)*)"?', rest)
+            if qm and qm.group(1).strip():
+                return qm.group(1).strip()
+
+        # Case 2: unquoted value — grab until }, comma, or end of string
+        um = re.match(r'([^,}\]]+)', rest)
+        if um and um.group(1).strip():
+            return um.group(1).strip()
+
+    # --- Markdown-style: **prompt**: value  /  **Prompt:** value ---
+    md = re.search(
+        r'(?:\*\*|#+\s*)prompt\s*(?:\*\*)?\s*:?\s*(?:\*\*)?\s*(.+)',
+        text,
+        re.IGNORECASE,
+    )
+    if md:
+        # Value is everything on the same line (and continuation lines until next key)
+        start = md.end(1)
+        value = md.group(1).strip()
+        # If multiline, grab until next markdown key or end
+        rest_text = text[md.start(1):]
+        # Stop at next **key**: or ## header or end
+        block = re.split(r'\n\s*(?:\*\*\w|\#{1,3}\s|\-\s\*\*)', rest_text, maxsplit=1)[0]
+        block = block.strip()
+        if len(block) > len(value):
+            value = block
+        if value:
+            return value
+
+    return None
+
+
+def _extract_fallback_prompt(action: str, parsed: Optional[Dict]) -> str:
+    """
+    Best-effort prompt extraction when normal JSON parsing fails.
+
+    Priority:
+      1. Regex-extract value after "prompt" key from raw text (handles malformed JSON)
+      2. JSON parsed but no "prompt" → use longest string value
+      3. No JSON → strip <think> tags and use raw text
+      4. Absolute fallback → generic continuation
+    """
+    # Strip <think> tags first for all fallback paths
+    content = action or ""
+    answer_match = re.search(r"<answer>(.*?)</answer>", content, re.DOTALL)
+    if answer_match:
+        content = answer_match.group(1).strip()
+    elif "</think>" in content:
+        content = content.split("</think>")[-1].strip()
+
+    # Fallback 1: Regex-extract "prompt" value from raw (malformed) JSON
+    raw_prompt = _extract_prompt_value_raw(content)
+    if raw_prompt and len(raw_prompt) > 5:
+        return raw_prompt
+
+    # Fallback 2: JSON parsed but missing "prompt" key → use other fields
+    if parsed:
+        for key in ("attack_prompt", "message", "content", "query", "input"):
+            if key in parsed and isinstance(parsed[key], str) and parsed[key].strip():
+                return parsed[key].strip()
+        string_vals = [
+            v for v in parsed.values()
+            if isinstance(v, str) and len(v.strip()) > 20
+        ]
+        if string_vals:
+            return max(string_vals, key=len).strip()
+
+    # Fallback 3: Use raw text as-is
+    content = re.sub(r"```json\s*", "", content)
+    content = re.sub(r"```", "", content)
+    content = content.strip()
+    if content.startswith("{"):
+        # Extract readable text between quotes from broken JSON
+        quoted = re.findall(r'"([^"]{20,})"', content)
+        if quoted:
+            content = max(quoted, key=len)
+
+    content = content.strip()
+    if len(content) > 10:
+        return content
+
+    # Fallback 4: absolute last resort
+    return "Continue the conversation."
+
+
 def multiturn_conv_projection(actions: List[str]) -> Tuple[List[str], List[int]]:
     """
     Project attacker LLM outputs into parsed prompt strings.
 
     For each action:
-      1. Parse JSON (handling <think> tags, markdown, etc.)
-      2. Extract the "prompt" field
+      1. Parse JSON → extract "prompt" field (valid=1)
+      2. If that fails → best-effort fallback extraction (valid=0)
 
     Returns:
-        results: List[str] — extracted prompt strings
+        results: List[str] — extracted prompt strings (always non-empty)
         valids: List[int] — 1 if valid parse, 0 otherwise
     """
     results: List[str] = []
@@ -82,7 +184,8 @@ def multiturn_conv_projection(actions: List[str]) -> Tuple[List[str], List[int]]
             results.append(parsed["prompt"])
             valids.append(1)
         else:
-            results.append("")
+            # Fallback: salvage whatever we can
+            results.append(_extract_fallback_prompt(action, parsed))
             valids.append(0)
 
     return results, valids

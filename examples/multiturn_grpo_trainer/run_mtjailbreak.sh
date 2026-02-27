@@ -17,10 +17,15 @@ ray stop 2>/dev/null || true
 sleep 2
 
 # --- Config ---
-train_data_size=2
+train_data_size=520
+train_batch_size=4
 val_data_size=2
-group_size=5
+group_size=4
 lambda_div=0.0
+ppo_mini_batch_size=$((train_batch_size * group_size))
+steps_per_epoch=$((train_data_size / train_batch_size))
+total_epochs=1
+total_training_steps=2  # debug; production: $((total_epochs * steps_per_epoch))
 
 # --- Project ---
 export project_name="verl_agent_multiturn"
@@ -45,12 +50,12 @@ MODEL_PATH="Qwen/Qwen3-4B-Instruct-2507"
 # Actor (policy model): GPU 0, 1
 # Target (victim model): GPU 7
 # Judge model: GPU 6
-TARGET_GPU=7
-JUDGE_GPU=6
-TARGET_PORT=9011
-JUDGE_PORT=9012
+TARGET_GPU=0
+JUDGE_GPU=1
+TARGET_PORT=8011
+JUDGE_PORT=8012
 TARGET_MODEL="meta-llama/Llama-3.1-8B-Instruct"
-JUDGE_MODEL="Qwen/Qwen3Guard-Gen-0.6B"
+JUDGE_MODEL="Qwen/Qwen3Guard-Gen-8B"
 MAX_TURNS=5
 
 LOG_DIR="$(dirname "$0")/logs_mtjailbreak"
@@ -121,14 +126,14 @@ sleep 1
 echo "🚀 Starting Target server..."
 setsid bash -c "CUDA_VISIBLE_DEVICES=$TARGET_GPU vllm serve \"$TARGET_MODEL\" \
     --host 0.0.0.0 --port $TARGET_PORT --max-model-len 16384 \
-    --dtype bfloat16 --gpu-memory-utilization 0.85 \
+    --dtype bfloat16 --gpu-memory-utilization 0.95 \
     > \"$LOG_DIR/target.log\" 2>&1" &
 TARGET_PID=$!
 
 echo "🚀 Starting Judge server..."
 setsid bash -c "CUDA_VISIBLE_DEVICES=$JUDGE_GPU vllm serve \"$JUDGE_MODEL\" \
     --host 0.0.0.0 --port $JUDGE_PORT --max-model-len 8192 \
-    --dtype bfloat16 --gpu-memory-utilization 0.5 \
+    --dtype bfloat16 --gpu-memory-utilization 0.95 \
     > \"$LOG_DIR/judge.log\" 2>&1" &
 JUDGE_PID=$!
 
@@ -143,28 +148,28 @@ echo "✨ All servers UP!"
 echo ""
 echo "🚀 Starting Multi-Turn GRPO Training..."
 
-export CUDA_VISIBLE_DEVICES=1,2
+export CUDA_VISIBLE_DEVICES=4,5
 
 python3 -m verl.trainer.main_ppo --config-name=mtjailbreak \
     data.train_files=$TRAIN_DATA \
     data.val_files=$VAL_DATA \
-    data.train_batch_size=$train_data_size \
+    data.train_batch_size=$train_batch_size \
     data.val_batch_size=$val_data_size \
-    data.max_prompt_length=8192 \
-    data.max_response_length=1024 \
+    data.max_prompt_length=16384 \
+    data.max_response_length=4096 \
     actor_rollout_ref.model.path=${MODEL_PATH} \
     actor_rollout_ref.model.use_remove_padding=true \
     actor_rollout_ref.model.enable_gradient_checkpointing=true \
     \
     `# === Memory Optimization: Actor ===` \
     actor_rollout_ref.actor.use_dynamic_bsz=true \
-    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=16384 \
-    actor_rollout_ref.actor.ppo_mini_batch_size=512 \
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=20480 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=$ppo_mini_batch_size \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2 \
     actor_rollout_ref.actor.fsdp_config.param_offload=true \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=true \
     actor_rollout_ref.actor.optim.lr=1e-6 \
-    actor_rollout_ref.actor.use_kl_loss=true \
+    actor_rollout_ref.actor.use_kl_loss=false \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     actor_rollout_ref.actor.entropy_coeff=0 \
@@ -176,13 +181,13 @@ python3 -m verl.trainer.main_ppo --config-name=mtjailbreak \
     `# === Memory Optimization: Rollout (vLLM) ===` \
     actor_rollout_ref.rollout.name=$ENGINE \
     actor_rollout_ref.rollout.tensor_model_parallel_size=2 \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=2 \
-    actor_rollout_ref.rollout.max_num_batched_tokens=8192 \
+    actor_rollout_ref.rollout.max_num_batched_tokens=16384 \
     actor_rollout_ref.rollout.enforce_eager=true \
     actor_rollout_ref.rollout.enable_chunked_prefill=false \
-    actor_rollout_ref.rollout.free_cache_engine=false \
-    actor_rollout_ref.rollout.temperature=1.0 \
+    actor_rollout_ref.rollout.free_cache_engine=true \
+    actor_rollout_ref.rollout.temperature=0.9 \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=16384 \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=16384 \
     actor_rollout_ref.rollout.response_length=1024 \
@@ -193,7 +198,7 @@ python3 -m verl.trainer.main_ppo --config-name=mtjailbreak \
     `# === Algorithm ===` \
     algorithm.adv_estimator=multiturn_grpo \
     algorithm.gamma=1.0 \
-    algorithm.lambda_div=$lambda_div \
+    +algorithm.lambda_div=$lambda_div \
     algorithm.use_kl_in_reward=false \
     algorithm.kl_ctrl.kl_coef=0.001 \
     \
@@ -213,10 +218,12 @@ python3 -m verl.trainer.main_ppo --config-name=mtjailbreak \
     trainer.logger='[console,wandb]' \
     trainer.val_before_train=false \
     trainer.save_freq=50 \
-    trainer.test_freq=50 \
-    trainer.total_epochs=1 \
+    trainer.test_freq=1 \
+    trainer.total_training_steps=$total_training_steps \
+    trainer.total_epochs=$total_epochs \
     trainer.default_local_dir=${OUTPUT} \
     trainer.validation_data_dir=${EVAL_LOG_PATH} \
     trainer.rollout_data_dir=./run_logs/${experiment_name}/train_rollout \
+    trainer.debug_validate_pipeline=true \
     trainer.resume_mode=disable \
     "$@" 2>&1 | tee ./logs/${project_name}_${experiment_name}.log
