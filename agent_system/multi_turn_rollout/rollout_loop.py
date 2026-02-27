@@ -399,14 +399,15 @@ class TrajectoryCollector:
             active_masks = np.logical_not(is_done)
 
             # ===== Debug Print (Obs) =====
-            print(f"\n====================================")
-            print(f"🚀 [Turn {_step}] PRE-PROCESS BATCH")
-            print(f"====================================")
-            try:
-                if obs and "text" in obs and obs["text"]:
-                    print(f"Env Obs[0]:\n{obs['text'][0]}\n")
-            except Exception as e:
-                print(f"Print Error: {e}")
+            if getattr(self.config.trainer, 'debug_validate_pipeline', False):
+                print(f"\n====================================")
+                print(f"🚀 [Turn {_step}] PRE-PROCESS BATCH")
+                print(f"====================================")
+                try:
+                    if obs and "text" in obs and obs["text"]:
+                        print(f"Env Obs[0]:\n{obs['text'][0]}\n")
+                except Exception as e:
+                    print(f"Print Error: {e}")
 
             batch = self.preprocess_batch(gen_batch=gen_batch, obs=obs)
 
@@ -445,26 +446,28 @@ class TrajectoryCollector:
             )
 
             # ===== Debug Print (Action) =====
-            print(f"====================================")
-            print(f"🎯 [Turn {_step}] ACTOR GENERATED ACTION")
-            print(f"====================================")
-            try:
-                print(f"Actor Action[0]:\n{text_actions[0]}\n")
-            except Exception as e:
-                print(f"Print Error: {e}")
+            if getattr(self.config.trainer, 'debug_validate_pipeline', False):
+                print(f"====================================")
+                print(f"🎯 [Turn {_step}] ACTOR GENERATED ACTION")
+                print(f"====================================")
+                try:
+                    print(f"Actor Action[0]:\n{text_actions[0]}\n")
+                except Exception as e:
+                    print(f"Print Error: {e}")
 
             next_obs, rewards, dones, infos = envs.step(text_actions)
 
             # ===== Debug Print (Step Result) =====
-            print(f"====================================")
-            print(f"📥 [Turn {_step}] ENV STEP RESULT")
-            print(f"====================================")
-            try:
-                print(f"Reward = {rewards if len(rewards) > 0 else 'N/A'}")
-                print(f"Dones = {dones}")
-                print(f"Is Done All? {np.logical_or(is_done, dones).all()}")
-            except Exception as e:
-                print(f"Print Error: {e}")
+            if getattr(self.config.trainer, 'debug_validate_pipeline', False):
+                print(f"====================================")
+                print(f"📥 [Turn {_step}] ENV STEP RESULT")
+                print(f"====================================")
+                try:
+                    print(f"Reward = {rewards if len(rewards) > 0 else 'N/A'}")
+                    print(f"Dones = {dones}")
+                    print(f"Is Done All? {np.logical_or(is_done, dones).all()}")
+                except Exception as e:
+                    print(f"Print Error: {e}")
 
             if len(rewards.shape) == 2:
                 rewards = rewards.squeeze(1)
