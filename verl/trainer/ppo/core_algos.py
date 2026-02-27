@@ -189,6 +189,7 @@ def compute_multiturn_grpo_advantage(
     response_mask: torch.Tensor,
     index: np.ndarray,
     traj_index: np.ndarray,
+    step_index: list[int] = None,
     gamma: float = 0.9,
     lambda_div: float = 0.1,
     epsilon: float = 1e-8,
@@ -218,22 +219,26 @@ def compute_multiturn_grpo_advantage(
             r_hat.append(r_hat_i)
 
         # ── Step 2: Group Normalization ──────────────────────────────────
+        # In multi-turn GRPO, each batch entry carries the FULL trajectory
+        # turn-level rewards (all turns, not just the current step).
+        # Therefore we must ALWAYS deduplicate by (uid, traj_uid) to avoid
+        # counting the same trajectory's rewards multiple times when it
+        # appears once per active step in the batch.
         id2rhat = defaultdict(list)
         id2mean = {}
         id2std = {}
         seen_pairs = set()
 
-        # collect flat rewards for each group
+        # collect flat rewards for each group (one per unique trajectory)
         for i in range(bsz):
             idx = index[i]
-            if (idx, traj_index[i]) in seen_pairs:
+            pair = (idx, traj_index[i])
+            if pair in seen_pairs:
                 continue
+            seen_pairs.add(pair)
 
             # extend the flat list with this trajectory's rewards
             id2rhat[idx].extend(r_hat[i])
-
-            if not compute_mean_std_cross_steps:
-                seen_pairs.add((idx, traj_index[i]))
 
         # calculate mean and std per group
         for idx in id2rhat:
@@ -277,13 +282,23 @@ def compute_multiturn_grpo_advantage(
             (bsz, max_tokens), dtype=torch.float32, device=response_mask.device
         )
 
-        for i in range(bsz):
-            mask = turn_token_mask[i]
-            for pos, t in enumerate(mask):
-                if pos >= max_tokens:
-                    break
-                if t >= 0 and t < len(A_tilde[i]):
-                    token_advantages[i, pos] = A_tilde[i][t]
+        if step_index is not None:
+            # Fixed mapping: each batch entry corresponds to one step (turn).
+            # Assign that turn's advantage uniformly to all response tokens.
+            for i in range(bsz):
+                step_idx = int(step_index[i])
+                if step_idx < len(A_tilde[i]):
+                    token_advantages[i, :] = A_tilde[i][step_idx]
+        else:
+            # Fallback: use turn_token_mask for per-token mapping
+            # (only correct when each batch entry contains the full trajectory)
+            for i in range(bsz):
+                mask = turn_token_mask[i]
+                for pos, t in enumerate(mask):
+                    if pos >= max_tokens:
+                        break
+                    if t >= 0 and t < len(A_tilde[i]):
+                        token_advantages[i, pos] = A_tilde[i][t]
 
         # Apply response_mask to zero out padded areas
         token_advantages = token_advantages * response_mask

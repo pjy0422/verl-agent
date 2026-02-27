@@ -48,7 +48,7 @@ def test_multiturn_grpo_advantage():
     index = np.array([0, 0, 1, 1])
     traj_index = np.array([0, 1, 2, 3])
 
-    adv, ret = compute_multiturn_grpo_advantage(
+    adv, ret, _ = compute_multiturn_grpo_advantage(
         turn_rewards=turn_rewards,
         turn_texts=turn_texts,
         turn_token_mask=turn_token_mask,

@@ -301,11 +301,13 @@ class TrajectoryCollector:
         effective_batch = []
         for bs in range(batch_size):
             # sum the rewards for each data in total_batch_list[bs]
-            for data in total_batch_list[bs]:
+            for step_idx, data in enumerate(total_batch_list[bs]):
                 assert (
                     traj_uid[bs] == data["traj_uid"]
                 ), "data is not from the same trajectory"
                 if data["active_masks"]:
+                    # Store which turn (step) this entry corresponds to
+                    data["step_index"] = step_idx
                     # episode_rewards
                     data["episode_rewards"] = episode_rewards[bs]
                     # episode_lengths

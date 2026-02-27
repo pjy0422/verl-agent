@@ -143,7 +143,7 @@ echo "✨ All servers UP!"
 echo ""
 echo "🚀 Starting Multi-Turn GRPO Training..."
 
-export CUDA_VISIBLE_DEVICES=0,1
+export CUDA_VISIBLE_DEVICES=1,2
 
 python3 -m verl.trainer.main_ppo --config-name=mtjailbreak \
     data.train_files=$TRAIN_DATA \
@@ -168,6 +168,7 @@ python3 -m verl.trainer.main_ppo --config-name=mtjailbreak \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     actor_rollout_ref.actor.entropy_coeff=0 \
+    actor_rollout_ref.actor.loss_agg_mode=seq-mean-token-mean \
     actor_rollout_ref.actor.use_invalid_action_penalty=true \
     actor_rollout_ref.actor.invalid_action_penalty_coef=0.1 \
     actor_rollout_ref.actor.ulysses_sequence_parallel_size=1 \
@@ -185,13 +186,14 @@ python3 -m verl.trainer.main_ppo --config-name=mtjailbreak \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=16384 \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=16384 \
     actor_rollout_ref.rollout.response_length=1024 \
-    actor_rollout_ref.rollout.prompt_length=8192 \
+    actor_rollout_ref.rollout.prompt_length=16384 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=2 \
     actor_rollout_ref.ref.fsdp_config.param_offload=true \
     \
     `# === Algorithm ===` \
     algorithm.adv_estimator=multiturn_grpo \
     algorithm.gamma=1.0 \
+    algorithm.lambda_div=$lambda_div \
     algorithm.use_kl_in_reward=false \
     algorithm.kl_ctrl.kl_coef=0.001 \
     \

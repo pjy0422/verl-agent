@@ -446,15 +446,25 @@ def compute_advantage(
         all_turn_rewards = data.non_tensor_batch["turn_rewards"].tolist()
         all_turn_texts = data.non_tensor_batch["turn_texts"].tolist()
         all_token_masks = data.non_tensor_batch["turn_token_mask"].tolist()
+        all_step_index = data.non_tensor_batch["step_index"].tolist()
+
+        # Use loss_mask for multi-turn: only assistant-generated tokens should
+        # receive advantage signal.  response_mask marks all non-pad tokens
+        # (including user/system), which would leak gradient into non-policy tokens.
+        grpo_mask = data.batch["response_mask"]
+        if "loss_mask" in data.batch:
+            response_length = grpo_mask.size(1)
+            grpo_mask = data.batch["loss_mask"][:, -response_length:]
 
         advantages, returns, turn_advantages = (
             core_algos.compute_multiturn_grpo_advantage(
                 turn_rewards=all_turn_rewards,
                 turn_texts=all_turn_texts,
                 turn_token_mask=all_token_masks,
-                response_mask=data.batch["response_mask"],
+                response_mask=grpo_mask,
                 index=data.non_tensor_batch["uid"],
                 traj_index=data.non_tensor_batch["traj_uid"],
+                step_index=all_step_index,
                 gamma=gamma,
                 lambda_div=kwargs.get("lambda_div", 0.1),
                 norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,

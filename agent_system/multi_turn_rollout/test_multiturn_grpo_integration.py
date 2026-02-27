@@ -69,6 +69,9 @@ def test_multiturn_grpo_advantage_ray_trainer_integration():
     data.non_tensor_batch["turn_token_mask"] = turn_token_mask
     data.non_tensor_batch["uid"] = index
     data.non_tensor_batch["traj_uid"] = traj_index
+    # step_index: which turn each batch entry corresponds to
+    # In this test, each entry represents a full trajectory, so use step 0
+    data.non_tensor_batch["step_index"] = np.array([0, 0, 0, 0])
 
     # Pass custom lambda_div
     data_out = compute_advantage(
