@@ -3,7 +3,7 @@ set -euo pipefail
 
 # ==========================================================
 # Multi-Turn GRPO Training Script (2 GPU version)
-# Memory-optimized for Qwen2.5-7B on 2 GPUs
+# Memory-optimized for Qwen3-4B on 2 GPUs
 # ==========================================================
 
 ENGINE=${1:-vllm}
@@ -26,10 +26,11 @@ ppo_mini_batch_size=$((train_batch_size * group_size))
 steps_per_epoch=$((train_data_size / train_batch_size))
 total_epochs=4
 total_training_steps=$((total_epochs * steps_per_epoch))
+#total_training_steps=1
 
 # --- Project ---
 export project_name="verl_agent_multiturn"
-export experiment_name="multiturn_grpo_qwen2.5_7b_2gpu"
+export experiment_name="multiturn_grpo_qwen3_4b_2gpu"
 export OUTPUT="./outputs/${project_name}/${experiment_name}"
 export EVAL_LOG_PATH="./eval_logs/${project_name}/${experiment_name}"
 mkdir -p $OUTPUT $EVAL_LOG_PATH ./logs
@@ -165,7 +166,7 @@ python3 -m verl.trainer.main_ppo --config-name=mtjailbreak \
     actor_rollout_ref.actor.use_dynamic_bsz=true \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=20480 \
     actor_rollout_ref.actor.ppo_mini_batch_size=$ppo_mini_batch_size \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.actor.fsdp_config.param_offload=true \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=true \
     actor_rollout_ref.actor.optim.lr=1e-6 \
@@ -181,15 +182,15 @@ python3 -m verl.trainer.main_ppo --config-name=mtjailbreak \
     `# === Memory Optimization: Rollout (vLLM) ===` \
     actor_rollout_ref.rollout.name=$ENGINE \
     actor_rollout_ref.rollout.tensor_model_parallel_size=2 \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=2 \
     actor_rollout_ref.rollout.max_num_batched_tokens=16384 \
     actor_rollout_ref.rollout.enforce_eager=true \
     actor_rollout_ref.rollout.enable_chunked_prefill=false \
     actor_rollout_ref.rollout.free_cache_engine=true \
     actor_rollout_ref.rollout.temperature=0.9 \
-    actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=16384 \
-    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=16384 \
+    actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=20480 \
+    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=20480 \
     actor_rollout_ref.rollout.response_length=1024 \
     actor_rollout_ref.rollout.prompt_length=16384 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=2 \

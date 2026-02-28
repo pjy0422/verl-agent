@@ -703,13 +703,13 @@ class MultiTurnConvEnvironmentManager(EnvironmentManagerBase):
       - Turn 2:
           A1 = Attacker's response from Turn 1
           T1 = Target's response to A1
-          U2 = MULTITURN_CONTINUATION_TEMPLATE.format(T1, ...)
+          U2 = MULTITURN_CONTINUATION_TEMPLATE.format(target_response=T1)
           Context: [System: S, User: U1, Assistant: A1, User: U2] -> Attacker generates A2
 
       - Turn 3:
           A2 = Attacker's response from Turn 2
           T2 = Target's response to A2
-          U3 = MULTITURN_CONTINUATION_TEMPLATE.format(T2, ...)
+          U3 = MULTITURN_CONTINUATION_TEMPLATE.format(target_response=T2)
           Context: [System: S, User: U1, Assistant: A1, User: U2, Assistant: A2, User: U3] -> Attacker generates A3
 
       ... and so on up to max_steps.
@@ -786,12 +786,8 @@ class MultiTurnConvEnvironmentManager(EnvironmentManagerBase):
                         {"role": "assistant", "content": attacker_actions[i]}
                     )
 
-                turn = infos[i].get("turn", 1) if infos else 1
                 user_prompt = MULTITURN_CONTINUATION_TEMPLATE.format(
                     target_response=text_obs[i],
-                    behavior=behavior,
-                    turn=turn,
-                    max_turns=self.max_turns,
                 )
                 self.attacker_histories[i].append(
                     {"role": "user", "content": user_prompt}
