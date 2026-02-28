@@ -25,8 +25,8 @@ lambda_div=0.0
 ppo_mini_batch_size=$((train_batch_size * group_size))
 steps_per_epoch=$((train_data_size / train_batch_size))
 total_epochs=4
-total_training_steps=$((total_epochs * steps_per_epoch))
-#total_training_steps=1
+#total_training_steps=$((total_epochs * steps_per_epoch))
+total_training_steps=1
 
 # --- Project ---
 export project_name="verl_agent_multiturn"
@@ -225,6 +225,6 @@ python3 -m verl.trainer.main_ppo --config-name=mtjailbreak \
     trainer.default_local_dir=${OUTPUT} \
     trainer.validation_data_dir=${EVAL_LOG_PATH} \
     trainer.rollout_data_dir=./run_logs/${experiment_name}/train_rollout \
-    trainer.debug_validate_pipeline=false \
+    trainer.debug_validate_pipeline=true \
     trainer.resume_mode=disable \
     "$@" 2>&1 | tee ./logs/${project_name}_${experiment_name}.log
