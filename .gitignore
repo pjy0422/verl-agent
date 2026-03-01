@@ -132,3 +132,8 @@ data/
 .tmp
 *ports
 
+# jsonl logs
+*.jsonl
+
+
+
