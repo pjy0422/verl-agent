@@ -315,5 +315,213 @@ class TestProcessValidationMetrics(unittest.TestCase):
         # depending on the random sampling, so we don't check the exact value
 
 
+class TestMultiTurnMetrics(unittest.TestCase):
+    """Tests for the multi-turn metrics in compute_data_metrics.
+
+    Scenario: 2 GRPO groups × 2 trajectories × 3 turns = 12 batch entries.
+
+    Group g0:
+      traj t0: turn_rewards=[0.2, 0.5, 0.95]  token_mask=[0,0,1,1,1,2,2]
+      traj t1: turn_rewards=[0.1, 0.3, 0.4]   token_mask=[0,0,0,1,1,2]
+    Group g1:
+      traj t2: turn_rewards=[0.8, 0.92, 0.7]  token_mask=[0,0,1,1,2,2,2]
+      traj t3: turn_rewards=[0.6, 0.85, 0.91] token_mask=[0,1,1,2,2]
+    """
+
+    def _make_batch(self):
+        batch_size = 12  # 4 trajectories × 3 turns
+        resp_len = 4
+        prompt_len = 4
+
+        # --- non_tensor_batch ---
+        traj_uids = []
+        uids = []
+        step_indices = []
+        turn_rewards_all = []
+        turn_token_mask_all = []
+        episode_rewards_all = []
+
+        trajs = [
+            ("t0", "g0", [0.2, 0.5, 0.95], [0, 0, 1, 1, 1, 2, 2]),
+            ("t1", "g0", [0.1, 0.3, 0.4],  [0, 0, 0, 1, 1, 2]),
+            ("t2", "g1", [0.8, 0.92, 0.7],  [0, 0, 1, 1, 2, 2, 2]),
+            ("t3", "g1", [0.6, 0.85, 0.91], [0, 1, 1, 2, 2]),
+        ]
+
+        for traj_uid, uid, rewards, tmask in trajs:
+            ep_reward = sum(rewards)
+            for step in range(3):
+                traj_uids.append(traj_uid)
+                uids.append(uid)
+                step_indices.append(step)
+                turn_rewards_all.append(rewards)
+                turn_token_mask_all.append(tmask)
+                episode_rewards_all.append(ep_reward)
+
+        non_tensor_batch = {
+            "traj_uid": np.array(traj_uids, dtype=object),
+            "uid": np.array(uids, dtype=object),
+            "step_index": np.array(step_indices, dtype=object),
+            "turn_rewards": np.array(turn_rewards_all, dtype=object),
+            "turn_token_mask": np.array(turn_token_mask_all, dtype=object),
+            "episode_rewards": np.array(episode_rewards_all, dtype=np.float32),
+            "episode_lengths": np.array([3] * batch_size, dtype=np.float32),
+            "tool_callings": np.array([0] * batch_size, dtype=np.float32),
+        }
+
+        # --- tensor batch (dummy values, just need the right shapes) ---
+        tensor_batch = {
+            "token_level_scores": torch.zeros(batch_size, resp_len),
+            "token_level_rewards": torch.zeros(batch_size, resp_len),
+            "advantages": torch.zeros(batch_size, resp_len),
+            "returns": torch.zeros(batch_size, resp_len),
+            "responses": torch.zeros(batch_size, resp_len),
+            "attention_mask": torch.ones(batch_size, prompt_len + resp_len),
+        }
+
+        batch = MagicMock()
+        batch.batch = tensor_batch
+        batch.non_tensor_batch = non_tensor_batch
+        return batch
+
+    def test_per_turn_reward_stats(self):
+        """turn_reward/turn_{t}/mean,std,max,min are correct."""
+        batch = self._make_batch()
+        metrics = compute_data_metrics(batch, use_critic=False)
+
+        # Turn 1 (t=0): [0.2, 0.1, 0.8, 0.6]
+        self.assertAlmostEqual(metrics["turn_reward/turn_1/mean"], 0.425, places=5)
+        self.assertAlmostEqual(metrics["turn_reward/turn_1/max"], 0.8, places=5)
+        self.assertAlmostEqual(metrics["turn_reward/turn_1/min"], 0.1, places=5)
+
+        # Turn 2 (t=1): [0.5, 0.3, 0.92, 0.85]
+        self.assertAlmostEqual(metrics["turn_reward/turn_2/mean"], 0.6425, places=5)
+        self.assertAlmostEqual(metrics["turn_reward/turn_2/max"], 0.92, places=5)
+        self.assertAlmostEqual(metrics["turn_reward/turn_2/min"], 0.3, places=5)
+
+        # Turn 3 (t=2): [0.95, 0.4, 0.7, 0.91]
+        self.assertAlmostEqual(metrics["turn_reward/turn_3/mean"], 0.74, places=5)
+        self.assertAlmostEqual(metrics["turn_reward/turn_3/max"], 0.95, places=5)
+        self.assertAlmostEqual(metrics["turn_reward/turn_3/min"], 0.4, places=5)
+
+        # std check for turn 1: std([0.2, 0.1, 0.8, 0.6])
+        expected_std = float(np.std([0.2, 0.1, 0.8, 0.6]))
+        self.assertAlmostEqual(metrics["turn_reward/turn_1/std"], expected_std, places=5)
+
+    def test_episode_success_rate(self):
+        """episode/success_rate with threshold=0.9."""
+        batch = self._make_batch()
+        metrics = compute_data_metrics(batch, use_critic=False)
+
+        # t0: max=0.95 >= 0.9 → success
+        # t1: max=0.4  < 0.9  → fail
+        # t2: max=0.92 >= 0.9 → success
+        # t3: max=0.91 >= 0.9 → success
+        # rate = 3/4 = 0.75
+        self.assertAlmostEqual(metrics["episode/success_rate"], 0.75, places=5)
+
+    def test_grpo_group_reward_std(self):
+        """grpo/group_reward_std/* are correct."""
+        batch = self._make_batch()
+        metrics = compute_data_metrics(batch, use_critic=False)
+
+        # g0: episode_rewards = [1.65, 0.8] → std
+        g0_std = float(np.std([1.65, 0.8]))
+        # g1: episode_rewards = [2.42, 2.36] → std
+        g1_std = float(np.std([2.42, 2.36]))
+
+        self.assertAlmostEqual(metrics["grpo/group_reward_std/mean"], (g0_std + g1_std) / 2, places=5)
+        self.assertAlmostEqual(metrics["grpo/group_reward_std/min"], min(g0_std, g1_std), places=5)
+        self.assertAlmostEqual(metrics["grpo/group_reward_std/max"], max(g0_std, g1_std), places=5)
+
+    def test_per_turn_response_length(self):
+        """turn_response_length/turn_{t}/mean,std are correct."""
+        batch = self._make_batch()
+        metrics = compute_data_metrics(batch, use_critic=False)
+
+        # Turn 1 (t=0) token counts: t0→2, t1→3, t2→2, t3→1
+        self.assertAlmostEqual(metrics["turn_response_length/turn_1/mean"], 2.0, places=5)
+        expected_std = float(np.std([2, 3, 2, 1]))
+        self.assertAlmostEqual(metrics["turn_response_length/turn_1/std"], expected_std, places=5)
+
+        # Turn 2 (t=1) token counts: t0→3, t1→2, t2→2, t3→2
+        self.assertAlmostEqual(metrics["turn_response_length/turn_2/mean"], 2.25, places=5)
+
+        # Turn 3 (t=2) token counts: t0→2, t1→1, t2→3, t3→2
+        self.assertAlmostEqual(metrics["turn_response_length/turn_3/mean"], 2.0, places=5)
+
+    def test_reward_delta(self):
+        """turn_reward/delta_last_first/mean,std are correct."""
+        batch = self._make_batch()
+        metrics = compute_data_metrics(batch, use_critic=False)
+
+        # deltas: t0→0.75, t1→0.3, t2→-0.1, t3→0.31
+        deltas = [0.95 - 0.2, 0.4 - 0.1, 0.7 - 0.8, 0.91 - 0.6]
+        self.assertAlmostEqual(metrics["turn_reward/delta_last_first/mean"], float(np.mean(deltas)), places=5)
+        self.assertAlmostEqual(metrics["turn_reward/delta_last_first/std"], float(np.std(deltas)), places=5)
+
+    def test_best_of_n(self):
+        """episode/reward/best_of_n is correct."""
+        batch = self._make_batch()
+        metrics = compute_data_metrics(batch, use_critic=False)
+
+        # g0: max(1.65, 0.8) = 1.65
+        # g1: max(2.42, 2.36) = 2.42
+        self.assertAlmostEqual(metrics["episode/reward/best_of_n"], (1.65 + 2.42) / 2, places=5)
+
+    def test_no_multiturn_metrics_without_turn_rewards(self):
+        """Multi-turn metrics are absent when turn_rewards is not in batch."""
+        batch = self._make_batch()
+        del batch.non_tensor_batch["turn_rewards"]
+        metrics = compute_data_metrics(batch, use_critic=False)
+
+        self.assertNotIn("turn_reward/turn_1/mean", metrics)
+        self.assertNotIn("episode/success_rate", metrics)
+        self.assertNotIn("grpo/group_reward_std/mean", metrics)
+        self.assertNotIn("episode/reward/best_of_n", metrics)
+
+    def test_single_trajectory_per_group_skips_group_std(self):
+        """grpo/group_reward_std is absent when each group has only 1 trajectory."""
+        batch_size = 6  # 2 trajectories × 3 turns
+        resp_len = 4
+        prompt_len = 4
+
+        traj_uids, uids, turn_rewards_all = [], [], []
+        episode_rewards_all = []
+        # Each trajectory in its own group
+        for traj_uid, uid, rewards in [
+            ("t0", "g0", [0.2, 0.5]),
+            ("t1", "g1", [0.8, 0.9]),
+        ]:
+            for step in range(3):
+                traj_uids.append(traj_uid)
+                uids.append(uid)
+                turn_rewards_all.append(rewards)
+                episode_rewards_all.append(sum(rewards))
+
+        batch = MagicMock()
+        batch.batch = {
+            "token_level_scores": torch.zeros(batch_size, resp_len),
+            "token_level_rewards": torch.zeros(batch_size, resp_len),
+            "advantages": torch.zeros(batch_size, resp_len),
+            "returns": torch.zeros(batch_size, resp_len),
+            "responses": torch.zeros(batch_size, resp_len),
+            "attention_mask": torch.ones(batch_size, prompt_len + resp_len),
+        }
+        batch.non_tensor_batch = {
+            "traj_uid": np.array(traj_uids, dtype=object),
+            "uid": np.array(uids, dtype=object),
+            "turn_rewards": np.array(turn_rewards_all, dtype=object),
+            "episode_rewards": np.array(episode_rewards_all, dtype=np.float32),
+            "episode_lengths": np.array([2] * batch_size, dtype=np.float32),
+            "tool_callings": np.array([0] * batch_size, dtype=np.float32),
+        }
+
+        metrics = compute_data_metrics(batch, use_critic=False)
+        self.assertNotIn("grpo/group_reward_std/mean", metrics)
+        # best_of_n should still work (each group has one trajectory)
+        self.assertIn("episode/reward/best_of_n", metrics)
+
+
 if __name__ == "__main__":
     unittest.main()

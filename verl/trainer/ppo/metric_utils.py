@@ -186,6 +186,74 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
         #     batch.non_tensor_batch["tool_callings"][unique_idx].min().item(),
         **({f"episode/{k}": v[0].item() for k, v in batch.non_tensor_batch.items() if "success_rate" in k}),
     }
+
+    # === Multi-turn metrics ===
+    if "turn_rewards" in batch.non_tensor_batch:
+        # Use unique trajectories only (avoid double-counting expanded step entries)
+        unique_turn_rewards = batch.non_tensor_batch["turn_rewards"][unique_idx]
+        unique_uids = batch.non_tensor_batch["uid"][unique_idx]
+
+        # Pre-convert all turn_rewards to plain Python lists once
+        all_rewards_lists = []
+        for traj_rewards in unique_turn_rewards:
+            all_rewards_lists.append(
+                traj_rewards if isinstance(traj_rewards, list) else traj_rewards.tolist()
+            )
+
+        # --- 1. Per-turn reward stats ---
+        turn_buckets = defaultdict(list)
+        for rewards_list in all_rewards_lists:
+            for t, r in enumerate(rewards_list):
+                turn_buckets[t].append(r)
+        for t in sorted(turn_buckets.keys()):
+            vals = turn_buckets[t]
+            metrics[f"turn_reward/turn_{t+1}/mean"] = float(np.mean(vals))
+            metrics[f"turn_reward/turn_{t+1}/std"] = float(np.std(vals))
+            metrics[f"turn_reward/turn_{t+1}/max"] = float(np.max(vals))
+            metrics[f"turn_reward/turn_{t+1}/min"] = float(np.min(vals))
+
+        # --- 2. Episode success rate (max turn reward >= threshold) ---
+        success_threshold = 0.9
+        successes = [float(max(rl) >= success_threshold) for rl in all_rewards_lists]
+        metrics["episode/success_rate"] = float(np.mean(successes))
+
+        # --- 3. GRPO group reward std ---
+        uid_to_episode_rewards = defaultdict(list)
+        for uid, rewards_list in zip(unique_uids, all_rewards_lists):
+            uid_to_episode_rewards[uid].append(sum(rewards_list))
+        group_stds = [float(np.std(rs)) for rs in uid_to_episode_rewards.values() if len(rs) > 1]
+        if group_stds:
+            metrics["grpo/group_reward_std/mean"] = float(np.mean(group_stds))
+            metrics["grpo/group_reward_std/min"] = float(np.min(group_stds))
+            metrics["grpo/group_reward_std/max"] = float(np.max(group_stds))
+
+        # --- 4. Per-turn response length (tokens) ---
+        if "turn_token_mask" in batch.non_tensor_batch:
+            unique_turn_masks = batch.non_tensor_batch["turn_token_mask"][unique_idx]
+            turn_len_buckets = defaultdict(list)
+            for tmask in unique_turn_masks:
+                mask_list = tmask if isinstance(tmask, list) else tmask.tolist()
+                turn_counts = defaultdict(int)
+                for turn_idx in mask_list:
+                    turn_counts[turn_idx] += 1
+                for t, count in turn_counts.items():
+                    turn_len_buckets[t].append(count)
+            for t in sorted(turn_len_buckets.keys()):
+                vals = turn_len_buckets[t]
+                metrics[f"turn_response_length/turn_{t+1}/mean"] = float(np.mean(vals))
+                metrics[f"turn_response_length/turn_{t+1}/std"] = float(np.std(vals))
+
+        # --- 5. Reward delta (last turn - first turn) ---
+        deltas = [rl[-1] - rl[0] for rl in all_rewards_lists if len(rl) >= 2]
+        if deltas:
+            metrics["turn_reward/delta_last_first/mean"] = float(np.mean(deltas))
+            metrics["turn_reward/delta_last_first/std"] = float(np.std(deltas))
+
+        # --- 6. Best-of-N episode reward ---
+        best_of_n = [float(max(rs)) for rs in uid_to_episode_rewards.values()]
+        if best_of_n:
+            metrics["episode/reward/best_of_n"] = float(np.mean(best_of_n))
+
     return metrics
 
 
