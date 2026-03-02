@@ -47,6 +47,7 @@ class Tracking:
                 assert backend in self.supported_backend, f"{backend} is not supported"
 
         self.logger = {}
+        self._finished = False
 
         if "tracking" in default_backend or "wandb" in default_backend:
             import wandb
@@ -129,7 +130,10 @@ class Tracking:
             if backend is None or default_backend in backend:
                 logger_instance.log(data=data, step=step)
 
-    def __del__(self):
+    def finish(self):
+        if self._finished:
+            return
+        self._finished = True
         if "wandb" in self.logger:
             self.logger["wandb"].finish(exit_code=0)
         if "swanlab" in self.logger:
@@ -138,9 +142,11 @@ class Tracking:
             self.logger["vemlp_wandb"].finish(exit_code=0)
         if "tensorboard" in self.logger:
             self.logger["tensorboard"].finish()
+        if "clearml" in self.logger:
+            self.logger["clearml"].finish()
 
-        if "clearnml" in self.logger:
-            self.logger["clearnml"].finish()
+    def __del__(self):
+        self.finish()
 
 
 class ClearMLLogger:

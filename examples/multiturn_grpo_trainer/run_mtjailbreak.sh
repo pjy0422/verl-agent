@@ -197,6 +197,7 @@ python3 -m verl.trainer.main_ppo --config-name=mtjailbreak \
     actor_rollout_ref.rollout.prompt_length=16384 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=2 \
     actor_rollout_ref.ref.fsdp_config.param_offload=true \
+    actor_rollout_ref.actor.checkpoint.contents='[model,optimizer,extra,hf_model]' \
     \
     `# === Algorithm ===` \
     algorithm.adv_estimator=multiturn_grpo \
