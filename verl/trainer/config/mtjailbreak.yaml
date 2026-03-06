@@ -25,7 +25,7 @@ data:
   trust_remote_code: False
   apply_chat_template_kwargs: {}
   custom_cls:
-    path: /home/pjy0422/workspace/verl-agent/examples/multiturn_grpo_trainer/jailbreak_dataset.py
+    path: /home2/pjy0422/workspace/verl-agent/examples/multiturn_grpo_trainer/jailbreak_dataset.py
     name: JailbreakDataset
 
 # Actor, Rollout, Reference model configuration
@@ -296,6 +296,7 @@ trainer:
 # Ray initialization
 ray_init:
   num_cpus: null
+  _temp_dir: /tmp/ray_short
 
 # Multi-turn conversation environment configuration
 env:

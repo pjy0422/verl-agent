@@ -1,15 +1,54 @@
 #!/bin/bash
+#SBATCH --job-name=MT_GRPO
+#SBATCH --partition=RTX6000ADA,A6000,L40S
+#SBATCH --nodes=1
+#SBATCH --gres=gpu:4
+#SBATCH --cpus-per-task=16
+#SBATCH --time=72:00:00
+#SBATCH --output=logs/%x_%j.out
+#SBATCH --error=logs/%x_%j.err
+#SBATCH --exclude=n68
+
 set -euo pipefail
 
 # ==========================================================
-# Multi-Turn GRPO Training Script (2 GPU version)
-# Memory-optimized for Qwen3-4B on 2 GPUs
+# Multi-Turn GRPO Training Script (4 GPU: 2 vLLM + 2 Actor)
 # ==========================================================
+
+# --- SLURM environment ---
+module load cuda/12.9
+export TRITON_PTXAS_PATH=/usr/bin/ptxas
+export USE_HF=1
+export HF_ENDPOINT=https://huggingface.co
+source ~/verl-agent/bin/activate
 
 ENGINE=${1:-vllm}
 export VLLM_ATTENTION_BACKEND=FLASH_ATTN
 export HYDRA_FULL_ERROR=1
 export RAY_memory_monitor_refresh_ms=0
+
+# --- SLURM GPU handling ---
+# SLURM sets both CUDA_VISIBLE_DEVICES and ROCR_VISIBLE_DEVICES.
+# verl crashes if both are set. Unset ROCR and let CUDA_VISIBLE_DEVICES handle GPU mapping.
+unset ROCR_VISIBLE_DEVICES 2>/dev/null || true
+
+# --- Local scratch directory (SLURM cluster storage policy) ---
+# Redirect temp/cache writes to local SSD to avoid filling shared /tmp (tmpfs)
+if [ -n "${SLURM_JOB_ID:-}" ]; then
+    BASE="/local-data/user-data/${USER}/job_${SLURM_JOB_ID}"
+    export LOCAL_JOB_BASE=$BASE
+    export WANDB_DIR=$BASE/wandb
+    export TORCH_EXTENSIONS_DIR=$BASE/torch_ext
+    export CUDA_CACHE_PATH=$BASE/cuda_cache
+    export PIP_CACHE_DIR=$BASE/pip_cache
+    export TMPDIR=$BASE/tmp
+    mkdir -p $WANDB_DIR $TORCH_EXTENSIONS_DIR $CUDA_CACHE_PATH $PIP_CACHE_DIR $TMPDIR $BASE/ray
+    # Symlink for Ray: AF_UNIX socket path must be < 107 bytes
+    rm -f /tmp/ray_short
+    ln -sf $BASE/ray /tmp/ray_short
+    echo "📁 Ray temp: /tmp/ray_short -> $BASE/ray"
+    echo "📁 Using local scratch: $BASE"
+fi
 
 # --- Clean up any existing Ray cluster ---
 echo "🧹 Cleaning up any existing Ray cluster..."
@@ -20,24 +59,25 @@ sleep 2
 train_data_size=520
 train_batch_size=4
 val_data_size=2
-group_size=4
+group_size=8
 lambda_div=0.0
 ppo_mini_batch_size=$((train_batch_size * group_size))
 steps_per_epoch=$((train_data_size / train_batch_size))
-total_epochs=4
+total_epochs=5
 total_training_steps=$((total_epochs * steps_per_epoch))
 #total_training_steps=1
 
 # --- Project ---
 export project_name="verl_agent_multiturn"
-export experiment_name="multiturn_grpo_qwen3_4b_2gpu"
+export experiment_name="multiturn_grpo_qwen3_4b_2gpu_1turn_only"
 export OUTPUT="./outputs/${project_name}/${experiment_name}"
 export EVAL_LOG_PATH="./eval_logs/${project_name}/${experiment_name}"
 mkdir -p $OUTPUT $EVAL_LOG_PATH ./logs
 
 # Prepare jailbreak behavior data
 echo "🔧 Preparing jailbreak behavior data..."
-SCRIPT_DIR="$(dirname "$0")"
+SCRIPT_DIR="/home2/pjy0422/workspace/verl-agent/examples/multiturn_grpo_trainer"
+cd "$SCRIPT_DIR"
 python3 "$SCRIPT_DIR/prepare_jailbreak_data.py" \
     --local_dir "$HOME/data/verl-agent/jailbreak" \
     --train_data_size $train_data_size \
@@ -47,25 +87,25 @@ TRAIN_DATA="$HOME/data/verl-agent/jailbreak/train.parquet"
 VAL_DATA="$HOME/data/verl-agent/jailbreak/test.parquet"
 MODEL_PATH="Qwen/Qwen3-4B-Instruct-2507"
 
-# --- GPU Assignment ---
-# Actor (policy model): GPU 0, 1
-# Target (victim model): GPU 7
-# Judge model: GPU 6
-TARGET_GPU=0
-JUDGE_GPU=1
-TARGET_PORT=8011
-JUDGE_PORT=8012
+# --- GPU Assignment (relative to SLURM allocation) ---
+# Parse SLURM-allocated GPUs to get physical IDs
+IFS=',' read -ra GPUS <<< "${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+TARGET_GPU=${GPUS[0]}
+JUDGE_GPU=${GPUS[1]}
+ACTOR_GPUS="${GPUS[2]},${GPUS[3]}"
+TARGET_PORT=9011
+JUDGE_PORT=9012
 TARGET_MODEL="meta-llama/Llama-3.1-8B-Instruct"
 JUDGE_MODEL="Qwen/Qwen3Guard-Gen-8B"
-MAX_TURNS=5
+MAX_TURNS=1
 
-LOG_DIR="$(dirname "$0")/logs_mtjailbreak"
+LOG_DIR="${SCRIPT_DIR}/logs_mtjailbreak"
 mkdir -p "$LOG_DIR"
 
 echo "=============================================="
 echo " MultiTurnConvEnv GRPO Training (2 GPU)      "
 echo "=============================================="
-echo " Actor    : $MODEL_PATH          (GPU 0,1)"
+echo " Actor    : $MODEL_PATH          (GPU $ACTOR_GPUS)"
 echo " Target   : $TARGET_MODEL        (GPU $TARGET_GPU)"
 echo " Judge    : $JUDGE_MODEL         (GPU $JUDGE_GPU)"
 echo " Max Turns: $MAX_TURNS"
@@ -149,7 +189,7 @@ echo "✨ All servers UP!"
 echo ""
 echo "🚀 Starting Multi-Turn GRPO Training..."
 
-export CUDA_VISIBLE_DEVICES=4,5
+export CUDA_VISIBLE_DEVICES=$ACTOR_GPUS
 
 python3 -m verl.trainer.main_ppo --config-name=mtjailbreak \
     data.train_files=$TRAIN_DATA \
@@ -171,7 +211,9 @@ python3 -m verl.trainer.main_ppo --config-name=mtjailbreak \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.actor.fsdp_config.param_offload=true \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=true \
-    actor_rollout_ref.actor.optim.lr=1e-6 \
+    actor_rollout_ref.actor.optim.lr=1e-5 \
+    actor_rollout_ref.actor.optim.warmup_style=constant \
+    actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.4 \
     actor_rollout_ref.actor.use_kl_loss=false \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
@@ -193,7 +235,7 @@ python3 -m verl.trainer.main_ppo --config-name=mtjailbreak \
     actor_rollout_ref.rollout.temperature=0.9 \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=20480 \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=20480 \
-    actor_rollout_ref.rollout.response_length=1024 \
+    actor_rollout_ref.rollout.response_length=2048 \
     actor_rollout_ref.rollout.prompt_length=16384 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=2 \
     actor_rollout_ref.ref.fsdp_config.param_offload=true \
@@ -231,3 +273,36 @@ python3 -m verl.trainer.main_ppo --config-name=mtjailbreak \
     trainer.debug_validate_pipeline=false \
     trainer.resume_mode=disable \
     "$@" 2>&1 | tee ./logs/${project_name}_${experiment_name}.log
+
+# ===========================================================
+# 3. Merge FSDP checkpoints to HuggingFace format (every 130 steps)
+# ===========================================================
+echo ""
+echo "🔧 Merging FSDP checkpoints to HuggingFace format..."
+
+CKPT_BASE="${OUTPUT}"
+MERGE_BASE="${OUTPUT}/merged_hf"
+mkdir -p "$MERGE_BASE"
+
+for ckpt_dir in "$CKPT_BASE"/global_step_*/actor; do
+    [ -d "$ckpt_dir" ] || continue
+    step_dir=$(basename "$(dirname "$ckpt_dir")")
+    step_num=${step_dir#global_step_}
+    # Only merge multiples of 130
+    if (( step_num % 130 == 0 )); then
+        target="$MERGE_BASE/$step_dir"
+        if [ -d "$target" ] && [ -f "$target/config.json" ]; then
+            echo "⏭️  Skip $step_dir (already merged)"
+            continue
+        fi
+        echo "🔀 Merging $step_dir ..."
+        python3 -m verl.model_merger merge \
+            --backend fsdp \
+            --local_dir "$ckpt_dir" \
+            --target_dir "$target" && \
+        echo "✅ Merged: $target" || \
+        echo "❌ Failed: $step_dir"
+    fi
+done
+
+echo "🏁 Checkpoint merging complete."
