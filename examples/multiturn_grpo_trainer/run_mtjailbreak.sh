@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=MT_GRPO
-#SBATCH --partition=RTX6000ADA,A6000,L40S
+#SBATCH --partition=L40S
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:4
 #SBATCH --cpus-per-task=16
@@ -32,14 +32,14 @@ export RAY_memory_monitor_refresh_ms=0
 # verl crashes if both are set. Unset ROCR and let CUDA_VISIBLE_DEVICES handle GPU mapping.
 unset ROCR_VISIBLE_DEVICES 2>/dev/null || true
 
-# RTX/Workstation GPU 노드에서 NCCL 우회
-PARTITION="${SLURM_JOB_PARTITION:-unknown}"
-if [[ "$PARTITION" == "RTX6000ADA" || "$PARTITION" == "A6000" ]]; then
-    export NCCL_P2P_DISABLE=1
-    export NCCL_IB_DISABLE=1
-    export NCCL_TIMEOUT=3600
-    echo "⚠️  RTX/Workstation partition detected — NCCL P2P/IB disabled"
-fi
+# # RTX/Workstation GPU 노드에서 NCCL 우회
+# PARTITION="${SLURM_JOB_PARTITION:-unknown}"
+# if [[ "$PARTITION" == "RTX6000ADA" || "$PARTITION" == "A6000" ]]; then
+#     export NCCL_P2P_DISABLE=1
+#     export NCCL_IB_DISABLE=1
+#     export NCCL_TIMEOUT=3600
+#     echo "⚠️  RTX/Workstation partition detected — NCCL P2P/IB disabled"
+# fi
 
 # --- Local scratch directory (SLURM cluster storage policy) ---
 # Redirect temp/cache writes to local SSD to avoid filling shared /tmp (tmpfs)
