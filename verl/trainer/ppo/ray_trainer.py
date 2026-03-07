@@ -279,10 +279,19 @@ def apply_invalid_action_penalty(data: DataProto, invalid_action_penalty_coef=fl
         if "step_rewards" in data.batch.keys():
             step_rewards[i] -= invalid_action_penalty_coef * action_invalids
 
-    valid_action_ratio = np.mean(
-        data.non_tensor_batch["is_action_valid"].astype(np.float32)
-    ).item()
-    metrics = {"episode/valid_action_ratio": valid_action_ratio}
+    action_valids_all = data.non_tensor_batch["is_action_valid"].astype(np.float32)
+    valid_action_ratio = np.mean(action_valids_all).item()
+    # Count samples that received at least one invalid action penalty
+    n_total = len(data)
+    n_penalized = sum(
+        1 for i in range(n_total)
+        if not data[i].non_tensor_batch["is_action_valid"].all()
+    )
+    metrics = {
+        "episode/valid_action_ratio": valid_action_ratio,
+        "episode/penalized_samples": n_penalized,
+        "episode/total_samples": n_total,
+    }
     return data, metrics
 
 

@@ -1,6 +1,6 @@
 #!/bin/bash
-#SBATCH --job-name=MT_GRPO
-#SBATCH --partition=RTX6000ADA,A6000,L40S
+#SBATCH --job-name=MT_GRPO_JSON_PENALTY
+#SBATCH --partition=L40S
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:4
 #SBATCH --cpus-per-task=16
@@ -72,13 +72,13 @@ group_size=8
 lambda_div=0.0
 ppo_mini_batch_size=$((train_batch_size * group_size))
 steps_per_epoch=$((train_data_size / train_batch_size))
-total_epochs=8
+total_epochs=5
 total_training_steps=$((total_epochs * steps_per_epoch))
 #total_training_steps=1
 
 # --- Project ---
-export project_name="verl_agent_multiturn"
-export experiment_name="multiturn_grpo_qwen3_4b_2gpu"
+export project_name="verl_agent_single_turn_only"
+export experiment_name="multiturn_grpo_qwen3_4b_2gpu_1turn_json_penalty_1.0"
 export OUTPUT="./outputs/${project_name}/${experiment_name}"
 export EVAL_LOG_PATH="./eval_logs/${project_name}/${experiment_name}"
 mkdir -p $OUTPUT $EVAL_LOG_PATH ./logs
@@ -106,7 +106,7 @@ TARGET_PORT=9011
 JUDGE_PORT=9012
 TARGET_MODEL="meta-llama/Llama-3.1-8B-Instruct"
 JUDGE_MODEL="Qwen/Qwen3Guard-Gen-8B"
-MAX_TURNS=5
+MAX_TURNS=1
 
 LOG_DIR="${SCRIPT_DIR}/logs_mtjailbreak"
 mkdir -p "$LOG_DIR"
@@ -118,6 +118,7 @@ echo " Actor    : $MODEL_PATH          (GPU $ACTOR_GPUS)"
 echo " Target   : $TARGET_MODEL        (GPU $TARGET_GPU)"
 echo " Judge    : $JUDGE_MODEL         (GPU $JUDGE_GPU)"
 echo " Max Turns: $MAX_TURNS"
+echo " JSON Penalty Coef: 1.0"
 echo "=============================================="
 
 # ===========================================================
@@ -200,6 +201,7 @@ echo "🚀 Starting Multi-Turn GRPO Training..."
 
 export CUDA_VISIBLE_DEVICES=$ACTOR_GPUS
 
+TRAIN_EXIT=0
 python3 -m verl.trainer.main_ppo --config-name=mtjailbreak \
     data.train_files=$TRAIN_DATA \
     data.val_files=$VAL_DATA \
@@ -227,7 +229,7 @@ python3 -m verl.trainer.main_ppo --config-name=mtjailbreak \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     actor_rollout_ref.actor.entropy_coeff=0 \
-    actor_rollout_ref.actor.loss_agg_mode=seq-mean-token-mean \
+    actor_rollout_ref.actor.loss_agg_mode=token-mean \
     actor_rollout_ref.actor.use_invalid_action_penalty=true \
     actor_rollout_ref.actor.invalid_action_penalty_coef=1.0 \
     actor_rollout_ref.actor.ulysses_sequence_parallel_size=1 \
@@ -244,7 +246,7 @@ python3 -m verl.trainer.main_ppo --config-name=mtjailbreak \
     actor_rollout_ref.rollout.temperature=0.9 \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=20480 \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=20480 \
-    actor_rollout_ref.rollout.response_length=1024 \
+    actor_rollout_ref.rollout.response_length=2048 \
     actor_rollout_ref.rollout.prompt_length=16384 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=2 \
     actor_rollout_ref.ref.fsdp_config.param_offload=true \
@@ -272,7 +274,7 @@ python3 -m verl.trainer.main_ppo --config-name=mtjailbreak \
     trainer.experiment_name=${experiment_name} \
     trainer.logger='[console,wandb]' \
     trainer.val_before_train=false \
-    trainer.save_freq=130 \
+    trainer.save_freq=65 \
     trainer.test_freq=130 \
     trainer.total_training_steps=$total_training_steps \
     trainer.total_epochs=$total_epochs \
@@ -281,4 +283,10 @@ python3 -m verl.trainer.main_ppo --config-name=mtjailbreak \
     trainer.rollout_data_dir=./run_logs/${experiment_name}/train_rollout \
     trainer.debug_validate_pipeline=false \
     trainer.resume_mode=disable \
-    "$@" 2>&1 | tee ./logs/${project_name}_${experiment_name}.log
+    "$@" 2>&1 | tee ./logs/${project_name}_${experiment_name}.log || TRAIN_EXIT=$?
+
+if [ $TRAIN_EXIT -ne 0 ]; then
+    echo "⚠️  Training exited with code $TRAIN_EXIT (e.g. OOM)."
+fi
+
+exit $TRAIN_EXIT
