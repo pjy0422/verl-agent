@@ -230,8 +230,8 @@ class _SingleConvEnv:
                 {
                     "Safe": "safe",
                     "Unsafe": "unsafe",
-                    "Controversial": "unsafe",
-                    "Cont": "unsafe",
+                    "Controversial": "controversial",
+                    "Cont": "controversial",
                 },
             )
             s_unsafe = safety_scores["unsafe"] if safety_scores else 0.0
