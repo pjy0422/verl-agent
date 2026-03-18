@@ -33,17 +33,17 @@ from openai import AsyncOpenAI
 def parse_json_response(text: str) -> Optional[Dict[str, Any]]:
     """
     Parses the model output to extract JSON content.
-    Handles <think>, <answer>, and markdown code blocks.
+    Handles <reasoning>, <answer>, and markdown code blocks.
     """
     if not text:
         return None
 
-    # 1. Remove <think> tags and extract <answer> (if present)
+    # 1. Remove <reasoning> tags and extract <answer> (if present)
     answer_match = re.search(r"<answer>(.*?)</answer>", text, re.DOTALL)
     if answer_match:
         content = answer_match.group(1).strip()
-    elif "</think>" in text:
-        content = text.split("</think>")[-1].strip()
+    elif "</reasoning>" in text:
+        content = text.split("</reasoning>")[-1].strip()
     else:
         content = text.strip()
 
@@ -153,6 +153,7 @@ class _SingleConvEnv:
             "target_response": target_response,
             "safety_unsafe_prob": guard_result["safety_unsafe_prob"],
             "refusal_complied": guard_result["refusal_complied"],
+            "judge_error": guard_result.get("judge_error", False),
             "won": False,  # Changed to False to prevent early stopping if success breaks the loop
         }
 
@@ -245,11 +246,16 @@ class _SingleConvEnv:
             return {
                 "safety_unsafe_prob": s_unsafe,
                 "refusal_complied": r_refused <= r_complied,
+                "judge_error": False,
             }
 
         except Exception as e:
             print(f"⚠️ [MultiTurnConvEnv] Judge Analysis Error: {e}")
-            return {"safety_unsafe_prob": 0.0, "refusal_complied": True}
+            return {
+                "safety_unsafe_prob": 0.0,
+                "refusal_complied": True,
+                "judge_error": True,
+            }
 
 
 # =================================================================

@@ -301,6 +301,8 @@ ray_init:
 # Multi-turn conversation environment configuration
 env:
   env_name: multiturn_conv
+  prompt_type: json
+  format_reward_coef: 0.1
   seed: 0
   max_steps: 2
   history_length: 2

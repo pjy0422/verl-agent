@@ -1,9 +1,9 @@
 #!/bin/bash
-#SBATCH --job-name=MT_GRPO
+#SBATCH --job-name=MT_GRPO_4G
 #SBATCH --partition=L40S,RTX6000ADA
 #SBATCH --nodes=1
-#SBATCH --gres=gpu:4
-#SBATCH --cpus-per-task=16
+#SBATCH --gres=gpu:6
+#SBATCH --cpus-per-task=24
 #SBATCH --time=72:00:00
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
@@ -12,7 +12,7 @@
 set -euo pipefail
 
 # ==========================================================
-# Multi-Turn GRPO Training Script (4 GPU: 2 vLLM + 2 Actor)
+# Multi-Turn GRPO Training Script (6 GPU: 2 vLLM + 4 Actor)
 # ==========================================================
 
 # --- SLURM environment ---
@@ -66,9 +66,9 @@ sleep 2
 
 # --- Config ---
 train_data_size=520
-train_batch_size=2
+train_batch_size=4
 val_data_size=2
-group_size=8
+group_size=10
 lambda_div=0.0
 ppo_mini_batch_size=$((train_batch_size * group_size))
 steps_per_epoch=$((train_data_size / train_batch_size))
@@ -78,7 +78,7 @@ total_training_steps=$((total_epochs * steps_per_epoch))
 
 # --- Project ---
 export project_name="verl_agent_multiturn"
-export experiment_name="multiturn_grpo_qwen3_4b_2gpu"
+export experiment_name="multiturn_grpo_qwen3_4b_4gpu"
 export OUTPUT="./outputs/${project_name}/${experiment_name}"
 export EVAL_LOG_PATH="./eval_logs/${project_name}/${experiment_name}"
 mkdir -p $OUTPUT $EVAL_LOG_PATH ./logs
@@ -98,10 +98,10 @@ MODEL_PATH="Qwen/Qwen3-4B-Instruct-2507"
 
 # --- GPU Assignment (relative to SLURM allocation) ---
 # Parse SLURM-allocated GPUs to get physical IDs
-IFS=',' read -ra GPUS <<< "${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+IFS=',' read -ra GPUS <<< "${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5}"
 TARGET_GPU=${GPUS[0]}
 JUDGE_GPU=${GPUS[1]}
-ACTOR_GPUS="${GPUS[2]},${GPUS[3]}"
+ACTOR_GPUS="${GPUS[2]},${GPUS[3]},${GPUS[4]},${GPUS[5]}"
 TARGET_PORT=9011
 JUDGE_PORT=9012
 TARGET_MODEL="meta-llama/Llama-3.1-8B-Instruct"
@@ -115,7 +115,7 @@ LOG_DIR="${SCRIPT_DIR}/logs_mtjailbreak"
 mkdir -p "$LOG_DIR"
 
 echo "=============================================="
-echo " MultiTurnConvEnv GRPO Training (2 GPU)      "
+echo " MultiTurnConvEnv GRPO Training (4 GPU)      "
 echo "=============================================="
 echo " Actor    : $MODEL_PATH          (GPU $ACTOR_GPUS)"
 echo " Target   : $TARGET_MODEL        (GPU $TARGET_GPU)"
@@ -277,14 +277,14 @@ python3 -m verl.trainer.main_ppo --config-name=mtjailbreak \
     env.judge.model=$JUDGE_MODEL \
     \
     `# === Trainer ===` \
-    trainer.n_gpus_per_node=2 \
+    trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
     trainer.project_name=${project_name} \
     trainer.experiment_name=${experiment_name} \
     trainer.logger='[console,wandb]' \
     trainer.val_before_train=false \
-    trainer.save_freq=65 \
-    trainer.test_freq=130 \
+    trainer.save_freq=33 \
+    trainer.test_freq=65 \
     trainer.total_training_steps=$total_training_steps \
     trainer.total_epochs=$total_epochs \
     trainer.default_local_dir=${OUTPUT} \

@@ -13,5 +13,5 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .projection import multiturn_conv_projection
+from .projection import multiturn_conv_projection, multiturn_conv_projection_xml
 from .envs import build_multiturn_conv_envs

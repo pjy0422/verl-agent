@@ -42,8 +42,8 @@ def parse_json_response(text: str) -> Optional[Dict[str, Any]]:
     answer_match = re.search(r"<answer>(.*?)</answer>", text, re.DOTALL)
     if answer_match:
         content = answer_match.group(1).strip()
-    elif "</think>" in text:
-        content = text.split("</think>")[-1].strip()
+    elif "</reasoning>" in text:
+        content = text.split("</reasoning>")[-1].strip()
     else:
         content = text.strip()
 
@@ -271,10 +271,10 @@ async def run_e2e_test(args) -> List[TestResult]:
     print("=" * 60)
 
     test_cases = [
-        ('<think>reason</think>{"rationale":"r","prompt":"p1"}', "p1", True),
+        ('<reasoning>reason</reasoning>{"rationale":"r","prompt":"p1"}', "p1", True),
         ('{"rationale":"r","prompt":"p2"}', "p2", True),
         ("no json here", "", False),
-        ("<think>only</think>", "", False),
+        ("<reasoning>only</reasoning>", "", False),
         ('```json\n{"rationale":"r","prompt":"p3"}\n```', "p3", True),
     ]
     all_proj_pass = True

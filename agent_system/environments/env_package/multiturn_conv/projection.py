@@ -21,18 +21,18 @@ from typing import Any, Dict, List, Optional, Tuple
 def parse_json_response(text: str) -> Optional[Dict[str, Any]]:
     """
     Parses the model output to extract JSON content.
-    Handles <think>, <answer>, and markdown code blocks.
+    Handles <reasoning>, <answer>, and markdown code blocks.
     (Same logic as attack_plugin.py)
     """
     if not text:
         return None
 
-    # 1. Remove <think> tags and extract <answer> (if present)
+    # 1. Remove <reasoning> tags and extract <answer> (if present)
     answer_match = re.search(r"<answer>(.*?)</answer>", text, re.DOTALL)
     if answer_match:
         content = answer_match.group(1).strip()
-    elif "</think>" in text:
-        content = text.split("</think>")[-1].strip()
+    elif "</reasoning>" in text:
+        content = text.split("</reasoning>")[-1].strip()
     else:
         content = text.strip()
 
@@ -117,16 +117,16 @@ def _extract_fallback_prompt(action: str, parsed: Optional[Dict]) -> str:
     Priority:
       1. Regex-extract value after "prompt" key from raw text (handles malformed JSON)
       2. JSON parsed but no "prompt" → use longest string value
-      3. No JSON → strip <think> tags and use raw text
+      3. No JSON → strip <reasoning> tags and use raw text
       4. Absolute fallback → generic continuation
     """
-    # Strip <think> tags first for all fallback paths
+    # Strip <reasoning> tags first for all fallback paths
     content = action or ""
     answer_match = re.search(r"<answer>(.*?)</answer>", content, re.DOTALL)
     if answer_match:
         content = answer_match.group(1).strip()
-    elif "</think>" in content:
-        content = content.split("</think>")[-1].strip()
+    elif "</reasoning>" in content:
+        content = content.split("</reasoning>")[-1].strip()
 
     # Fallback 1: Regex-extract "prompt" value from raw (malformed) JSON
     raw_prompt = _extract_prompt_value_raw(content)
@@ -161,6 +161,85 @@ def _extract_fallback_prompt(action: str, parsed: Optional[Dict]) -> str:
 
     # Fallback 4: absolute last resort
     return "Continue the conversation."
+
+
+def parse_xml_response(text: str) -> Optional[Dict[str, str]]:
+    """
+    Parse XML-formatted model output with <reasoning> and <answer> tags.
+
+    Returns:
+        {"rationale": ..., "prompt": ...} if at least <answer> is found, else None.
+    """
+    if not text:
+        return None
+
+    think_match = re.search(r"<reasoning>(.*?)</reasoning>", text, re.DOTALL)
+    answer_match = re.search(r"<answer>(.*?)</answer>", text, re.DOTALL)
+
+    if answer_match:
+        result: Dict[str, str] = {
+            "prompt": answer_match.group(1).strip(),
+        }
+        if think_match:
+            result["rationale"] = think_match.group(1).strip()
+        return result
+
+    return None
+
+
+def validate_xml_format(text: str) -> float:
+    """
+    Validate whether the text follows the expected XML format.
+
+    Returns:
+        1.0 — both <reasoning> and <answer> present with non-empty content
+        0.5 — only <answer> present with non-empty content
+        0.0 — otherwise
+    """
+    if not text:
+        return 0.0
+
+    think_match = re.search(r"<reasoning>(.*?)</reasoning>", text, re.DOTALL)
+    answer_match = re.search(r"<answer>(.*?)</answer>", text, re.DOTALL)
+
+    has_answer = answer_match is not None and answer_match.group(1).strip()
+    has_think = think_match is not None and think_match.group(1).strip()
+
+    if has_answer and has_think:
+        return 1.0
+    elif has_answer:
+        return 0.5
+    return 0.0
+
+
+def multiturn_conv_projection_xml(
+    actions: List[str],
+) -> Tuple[List[str], List[int], List[float]]:
+    """
+    Project attacker LLM outputs (XML format) into parsed prompt strings.
+
+    Returns:
+        results:       List[str]   — extracted prompt strings
+        valids:        List[int]   — 1 if valid XML parse, 0 otherwise
+        format_scores: List[float] — format quality score per action (0.0-1.0)
+    """
+    results: List[str] = []
+    valids: List[int] = []
+    format_scores: List[float] = []
+
+    for action in actions:
+        score = validate_xml_format(action)
+        format_scores.append(score)
+
+        parsed = parse_xml_response(action)
+        if parsed and "prompt" in parsed and parsed["prompt"]:
+            results.append(parsed["prompt"])
+            valids.append(1)
+        else:
+            results.append(_extract_fallback_prompt(action, None))
+            valids.append(0)
+
+    return results, valids, format_scores
 
 
 def multiturn_conv_projection(actions: List[str]) -> Tuple[List[str], List[int]]:

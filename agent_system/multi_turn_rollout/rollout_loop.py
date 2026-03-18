@@ -275,6 +275,7 @@ class TrajectoryCollector:
         turn_rewards_all: List[List[float]],
         turn_texts_all: List[List[str]],
         turn_token_mask_all: List[List[int]],
+        format_rewards_all: List[List[float]] = None,
     ) -> DataProto:
         """
         Collect and organize trajectory data, handling batch size adjustments to meet parallel training requirements.
@@ -320,6 +321,11 @@ class TrajectoryCollector:
                     data["turn_token_mask"] = np.array(
                         turn_token_mask_all[bs], dtype=object
                     )
+                    # format rewards (XML mode only)
+                    if format_rewards_all and len(format_rewards_all[bs]) > 0:
+                        data["format_rewards"] = np.array(
+                            format_rewards_all[bs], dtype=object
+                        )
                     # success_rate
                     for key, value in success_rate.items():
                         data[key] = value
@@ -393,6 +399,7 @@ class TrajectoryCollector:
         turn_rewards_all: List[List[float]] = [[] for _ in range(batch_size)]
         turn_texts_all: List[List[str]] = [[] for _ in range(batch_size)]
         turn_token_mask_all: List[List[int]] = [[] for _ in range(batch_size)]
+        format_rewards_all: List[List[float]] = [[] for _ in range(batch_size)]
 
         # Trajectory collection loop
         for _step in range(self.config.env.max_steps):
@@ -524,6 +531,10 @@ class TrajectoryCollector:
                     n_tokens = int((resp_ids != 0).sum().item())
                 turn_token_mask_all[i].extend([_step] * n_tokens)
 
+                # Per-turn format reward (XML mode only)
+                if "format_reward" in infos[i]:
+                    format_rewards_all[i].append(float(infos[i]["format_reward"]))
+
             # ===== Verification print (NEW) =====
             if _step == 0:
                 print(
@@ -579,6 +590,7 @@ class TrajectoryCollector:
             turn_rewards_all,
             turn_texts_all,
             turn_token_mask_all,
+            format_rewards_all,
         )
 
     def dynamic_multi_turn_loop(
@@ -617,6 +629,7 @@ class TrajectoryCollector:
         total_turn_rewards = []
         total_turn_texts = []
         total_turn_token_mask = []
+        total_format_rewards = []
         try_count: int = 0
         max_try_count = self.config.algorithm.filter_groups.max_num_gen_batches
 
@@ -642,6 +655,7 @@ class TrajectoryCollector:
                 turn_rewards,
                 turn_texts,
                 turn_token_mask,
+                format_rewards,
             ) = self.vanilla_multi_turn_loop(
                 gen_batch=gen_batch,
                 actor_rollout_wg=actor_rollout_wg,
@@ -680,6 +694,7 @@ class TrajectoryCollector:
             turn_rewards = [turn_rewards[i] for i in surviving_indices]
             turn_texts = [turn_texts[i] for i in surviving_indices]
             turn_token_mask = [turn_token_mask[i] for i in surviving_indices]
+            format_rewards = [format_rewards[i] for i in surviving_indices]
 
             total_batch_list += batch_list
             total_episode_rewards.append(episode_rewards)
@@ -690,6 +705,7 @@ class TrajectoryCollector:
             total_turn_rewards += turn_rewards
             total_turn_texts += turn_texts
             total_turn_token_mask += turn_token_mask
+            total_format_rewards += format_rewards
 
         total_episode_rewards = np.concatenate(total_episode_rewards, axis=0)
         total_episode_lengths = np.concatenate(total_episode_lengths, axis=0)
@@ -710,6 +726,7 @@ class TrajectoryCollector:
             total_turn_rewards,
             total_turn_texts,
             total_turn_token_mask,
+            total_format_rewards,
         )
 
     def multi_turn_loop(
@@ -749,6 +766,7 @@ class TrajectoryCollector:
                 total_turn_rewards,
                 total_turn_texts,
                 total_turn_token_mask,
+                total_format_rewards,
             ) = self.dynamic_multi_turn_loop(
                 gen_batch=gen_batch,
                 actor_rollout_wg=actor_rollout_wg,
@@ -766,6 +784,7 @@ class TrajectoryCollector:
                 total_turn_rewards,
                 total_turn_texts,
                 total_turn_token_mask,
+                total_format_rewards,
             ) = self.vanilla_multi_turn_loop(
                 gen_batch=gen_batch,
                 actor_rollout_wg=actor_rollout_wg,
@@ -796,6 +815,7 @@ class TrajectoryCollector:
             turn_rewards_all=total_turn_rewards,
             turn_texts_all=total_turn_texts,
             turn_token_mask_all=total_turn_token_mask,
+            format_rewards_all=total_format_rewards,
         )
 
         return gen_batch_output

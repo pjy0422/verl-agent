@@ -56,10 +56,10 @@ class TestParseJsonResponseFailure:
         assert parse_json_response('{"prompt": "hello') is None
 
     def test_only_think_tags(self):
-        assert parse_json_response("<think>some reasoning</think>") is None
+        assert parse_json_response("<reasoning>some reasoning</reasoning>") is None
 
     def test_think_then_garbage(self):
-        result = parse_json_response("<think>reasoning</think>not json at all")
+        result = parse_json_response("<reasoning>reasoning</reasoning>not json at all")
         assert result is None
 
     def test_markdown_block_with_invalid_json(self):
@@ -131,8 +131,8 @@ class TestFallbackPromptExtraction:
         assert result == "Continue the conversation."
 
     def test_think_tag_stripped_before_fallback(self):
-        """<think> 태그가 제거된 후 fallback 진행."""
-        action = '<think>reasoning here</think>{"rationale": "abc", "prompt": unquoted_prompt_text}'
+        """<reasoning> 태그가 제거된 후 fallback 진행."""
+        action = '<reasoning>reasoning here</reasoning>{"rationale": "abc", "prompt": unquoted_prompt_text}'
         result = _extract_fallback_prompt(action, parsed=None)
         assert "unquoted_prompt_text" in result
 
@@ -144,7 +144,7 @@ class TestMultiturnConvProjection:
         """모든 액션이 파싱 실패 → 전부 valid=0."""
         actions = [
             "This is plain text, not JSON",
-            "<think>reasoning</think>also not json",
+            "<reasoning>reasoning</reasoning>also not json",
             "",
         ]
         results, valids = multiturn_conv_projection(actions)
@@ -261,7 +261,7 @@ class TestEnvManagerParseFailureRollout:
         # 두 개 모두 파싱 실패하는 액션
         malformed_actions = [
             "This is not JSON at all",
-            "<think>reasoning</think>still not json",
+            "<reasoning>reasoning</reasoning>still not json",
         ]
         _, _, _, infos = self.env_manager.step(malformed_actions)
 

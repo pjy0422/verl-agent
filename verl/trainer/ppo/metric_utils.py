@@ -254,6 +254,33 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
         if best_of_n:
             metrics["episode/reward/best_of_n"] = float(np.mean(best_of_n))
 
+    # === Format reward metrics (XML mode only) ===
+    if "format_rewards" in batch.non_tensor_batch:
+        unique_format_rewards = batch.non_tensor_batch["format_rewards"][unique_idx]
+
+        all_format_lists = []
+        for fr in unique_format_rewards:
+            all_format_lists.append(
+                fr if isinstance(fr, list) else fr.tolist()
+            )
+
+        # Flatten all scores
+        all_scores = [s for fl in all_format_lists for s in fl]
+        if all_scores:
+            metrics["format_reward/mean"] = float(np.mean(all_scores))
+            metrics["format_reward/valid_format_ratio"] = float(
+                np.mean([1.0 if s == 1.0 else 0.0 for s in all_scores])
+            )
+
+            # Per-turn format scores
+            fmt_turn_buckets = defaultdict(list)
+            for fl in all_format_lists:
+                for t, s in enumerate(fl):
+                    fmt_turn_buckets[t].append(s)
+            for t in sorted(fmt_turn_buckets.keys()):
+                vals = fmt_turn_buckets[t]
+                metrics[f"format_reward/turn_{t+1}/mean"] = float(np.mean(vals))
+
     return metrics
 
 
