@@ -303,6 +303,7 @@ env:
   env_name: multiturn_conv
   prompt_type: json
   format_reward_coef: 0.1
+  prefill_text: ""  # Prefill text appended to assistant prompt (e.g. "<reasoning>" for XML mode)
   seed: 0
   max_steps: 2
   history_length: 2

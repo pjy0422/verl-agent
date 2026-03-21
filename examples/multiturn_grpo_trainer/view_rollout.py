@@ -85,6 +85,92 @@ def parse_output(output_text):
     return "", output_text
 
 
+def parse_conversation(input_text, output_text):
+    """Parse the full multi-turn conversation from input + output.
+
+    Returns a list of turns, each being a dict with:
+      - turn_num: 1-based turn number
+      - user: the user/environment message
+      - assistant: the assistant response (rationale + prompt parsed)
+      - raw_assistant: the raw assistant text
+    """
+    # Split on role markers: "system\n", "user\n", "assistant\n"
+    parts = re.split(r'(?:^|\n)(system|user|assistant)\n', input_text)
+
+    # Build (role, content) pairs
+    messages = []
+    i = 0
+    # parts[0] might be empty or contain text before first marker
+    if parts[0].strip():
+        # Check if input starts with a role marker
+        if parts[0].strip() in ('system', 'user', 'assistant'):
+            i = 0
+        else:
+            i = 1
+    else:
+        i = 1
+
+    while i < len(parts):
+        if parts[i] in ('system', 'user', 'assistant'):
+            role = parts[i]
+            content = parts[i + 1] if i + 1 < len(parts) else ""
+            messages.append((role, content.strip()))
+            i += 2
+        else:
+            i += 1
+
+    # Group into turns: each turn = (user_msg, assistant_msg)
+    turns = []
+    turn_num = 0
+    j = 0
+    # Skip system message
+    while j < len(messages) and messages[j][0] == 'system':
+        j += 1
+
+    while j < len(messages):
+        user_msg = ""
+        assistant_msg = ""
+
+        if j < len(messages) and messages[j][0] == 'user':
+            user_msg = messages[j][1]
+            j += 1
+
+        if j < len(messages) and messages[j][0] == 'assistant':
+            assistant_msg = messages[j][1]
+            j += 1
+
+        turn_num += 1
+        rationale, prompt = parse_output(assistant_msg) if assistant_msg else ("", "")
+        turns.append({
+            'turn_num': turn_num,
+            'user': user_msg,
+            'rationale': rationale,
+            'prompt': prompt,
+            'raw_assistant': assistant_msg,
+        })
+
+    # The last turn's assistant response is in output_text
+    # If the last turn in input has an empty assistant, fill it with output
+    if turns and not turns[-1]['raw_assistant']:
+        rationale, prompt = parse_output(output_text)
+        turns[-1]['rationale'] = rationale
+        turns[-1]['prompt'] = prompt
+        turns[-1]['raw_assistant'] = output_text
+    else:
+        # output_text is an additional turn's assistant response
+        # Check if there's a trailing user message without assistant
+        rationale, prompt = parse_output(output_text)
+        turns.append({
+            'turn_num': turn_num + 1,
+            'user': '',
+            'rationale': rationale,
+            'prompt': prompt,
+            'raw_assistant': output_text,
+        })
+
+    return turns
+
+
 def wrap(text, indent=4, width=None):
     """Word-wrap text with indent."""
     w = (width or TERM_WIDTH) - indent
@@ -102,13 +188,13 @@ def print_separator(char="─", label=""):
 
 
 def print_entry(entry, rank_label, color):
-    """Pretty-print a single rollout entry."""
+    """Pretty-print a single rollout entry with all turns."""
     behavior = extract_behavior(entry["input"])
     score = entry["score"]
     turn_rewards = entry.get("turn_rewards", [])
     turn_advantages = entry.get("turn_advantages", [])
-    rationale, prompt = parse_output(entry["output"])
-    num_turns = len(turn_rewards)
+    turns = parse_conversation(entry["input"], entry["output"])
+    num_turns = len(turn_rewards) or len(turns)
 
     # ── Header ──
     print()
@@ -120,38 +206,56 @@ def print_entry(entry, rank_label, color):
     print(f"  {C.BOLD}Behavior:{C.RESET} {C.CYAN}{behavior}{C.RESET}")
     print(f"  {C.BOLD}Turns:{C.RESET}    {num_turns}")
 
-    # ── Per-Turn Rewards ──
+    # ── Per-Turn Rewards & Advantages Summary ──
     if turn_rewards:
         print()
         print(f"  {C.BOLD}Turn Rewards:{C.RESET}")
         for i, r in enumerate(turn_rewards):
-            print(f"    Turn {i+1}: {r:+.4f}  {bar(r, 1.0, 20)}")
+            adv_str = ""
+            if i < len(turn_advantages):
+                a = turn_advantages[i]
+                adv_color = C.GREEN if a > 0 else C.RED
+                adv_str = f"  adv: {adv_color}{a:+.4f}{C.RESET}"
+            print(f"    Turn {i+1}: {r:+.4f}  {bar(r, 1.0, 20)}{adv_str}")
 
-    # ── Per-Turn Advantages ──
-    if turn_advantages:
-        print(f"  {C.BOLD}Turn Advantages:{C.RESET}")
-        adv_max = max(abs(a) for a in turn_advantages) or 1.0
-        for i, a in enumerate(turn_advantages):
-            sign_color = C.GREEN if a > 0 else C.RED
-            print(f"    Turn {i+1}: {sign_color}{a:+.4f}{C.RESET}")
-
-    # ── Rationale ──
-    if rationale:
+    # ── Per-Turn Conversation ──
+    if len(turns) < num_turns:
         print()
-        print(f"  {C.BOLD}Rationale:{C.RESET}")
-        print(f"{C.DIM}{wrap(rationale)}{C.RESET}")
+        print(f"  {C.DIM}(Only {len(turns)}/{num_turns} turns have conversation data stored){C.RESET}")
 
-    # ── Prompt/Action ──
-    if prompt:
+    for turn in turns:
+        t = turn['turn_num']
         print()
-        print(f"  {C.BOLD}Prompt → Target:{C.RESET}")
-        print(f"{C.WHITE}{wrap(prompt)}{C.RESET}")
+        # Turn header with reward info
+        reward_str = ""
+        if t - 1 < len(turn_rewards):
+            r = turn_rewards[t - 1]
+            reward_color = C.GREEN if r > 0 else C.RED
+            reward_str = f"  {reward_color}(reward: {r:+.4f}){C.RESET}"
+        print(f"  {C.BOLD}{C.BLUE}╔══ Turn {t}/{num_turns}{C.RESET}{reward_str}")
 
-    # ── Raw output (truncated) if parsing failed ──
-    if not rationale and not prompt:
-        print()
-        print(f"  {C.BOLD}Raw Output:{C.RESET}")
-        print(f"{C.DIM}{wrap(entry['output'][:600])}{C.RESET}")
+        # User/Environment message
+        if turn['user']:
+            print(f"  {C.BOLD}{C.YELLOW}║ [Environment → Agent]{C.RESET}")
+            user_text = turn['user']
+            if t == 1 and len(user_text) > 200:
+                # First turn user message is usually just the task instruction
+                user_text = user_text[:200] + "..."
+            print(f"{C.DIM}{wrap(user_text, indent=6)}{C.RESET}")
+
+        # Assistant response
+        if turn['rationale'] or turn['prompt']:
+            if turn['rationale']:
+                print(f"  {C.BOLD}{C.MAGENTA}║ [Agent Reasoning]{C.RESET}")
+                print(f"{C.DIM}{wrap(turn['rationale'], indent=6)}{C.RESET}")
+            if turn['prompt']:
+                print(f"  {C.BOLD}{C.WHITE}║ [Agent → Target]{C.RESET}")
+                print(f"{C.WHITE}{wrap(turn['prompt'], indent=6)}{C.RESET}")
+        elif turn['raw_assistant']:
+            print(f"  {C.BOLD}{C.WHITE}║ [Agent Response]{C.RESET}")
+            print(f"{C.DIM}{wrap(turn['raw_assistant'][:600], indent=6)}{C.RESET}")
+
+        print(f"  {C.BLUE}╚{'═' * 40}{C.RESET}")
 
     print_separator("─")
 

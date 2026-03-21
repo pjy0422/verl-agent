@@ -306,6 +306,260 @@ def compute_multiturn_grpo_advantage(
     return token_advantages, token_advantages, A_tilde
 
 
+def compute_dc_grpo_advantage(
+    turn_rewards: list[list[float]],
+    turn_texts: list[list[str]],
+    turn_token_mask: list[list[int]],
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    traj_index: np.ndarray,
+    step_index: list[int] = None,
+    gamma: float = 0.9,
+    alpha: float = None,
+    refusal_penalty_floor: float = -1.0,
+    lambda_div: float = 0.1,
+    epsilon: float = 1e-8,
+    norm_adv_by_std_in_grpo: bool = True,
+    compute_mean_std_cross_steps: bool = True,
+):
+    """
+    DC-GRPO (Decomposed Credit GRPO) — Method C from dc_grpo_v2.md
+
+    Advantage formula (Eq. Method C):
+        A_{i,t} = I_{i,t} + α · F_{i,t}
+                = (r_{i,t} - μ^r_t) / (σ^r_t + ε)  +  α · (R_{i,t+1} - μ^R_{t+1}) / (σ^R_{t+1} + ε)
+                  ─────────────────────────────────      ───────────────────────────────────────────────
+                  I_{i,t}  (immediate term)               F_{i,t}  (future term)
+
+    For last turn (t = T):
+        A_{i,T} = (r_{i,T} - μ^r_T) / (σ^r_T + ε)
+
+    Where:
+        γ (gamma) = discount factor for computing returns R_{i,t}
+        α (alpha) = weight for the future term in advantage (defaults to γ)
+        r_{i,t}   = reward of trajectory i at turn t
+        R_{i,t}   = discounted return from turn t onward: R_{i,t} = Σ_{k=t}^{T} γ^{k-t} · r_{i,k}
+        μ^r_t     = (1/G) Σ_j r_{j,t}     (group mean of immediate rewards at turn t)
+        σ^r_t     = std_j(r_{j,t})          (group std of immediate rewards at turn t)
+        μ^R_t     = (1/G) Σ_j R_{j,t}     (group mean of discounted returns from turn t)
+        σ^R_t     = std_j(R_{j,t})          (group std of discounted returns from turn t)
+    """
+    with torch.no_grad():
+        bsz = len(turn_rewards)
+
+        # α defaults to γ if not specified
+        if alpha is None:
+            alpha = gamma
+
+        # ── Step 1: Diversity-Augmented Reward ──────────────────────────
+        # r_hat_{i,t} = r_{i,t} + λ_div · diversity(i, t)
+        def diversity(i, t):
+            if lambda_div == 0:
+                return 0.0
+            return 1.0  # pass for now. not yet implemented.
+
+        r_hat = []
+        for i in range(bsz):
+            r_hat_i = [
+                turn_rewards[i][t] + lambda_div * diversity(i, t)
+                for t in range(len(turn_rewards[i]))
+            ]
+            r_hat.append(r_hat_i)
+
+        # ── Step 2: Group & deduplicate by (uid, traj_uid) ─────────────
+        # Group trajectories by prompt uid.
+        # Each trajectory i in group g has rewards [r_hat_{i,1}, ..., r_hat_{i,T_i}]
+        # G = number of unique trajectories in group g
+        group_trajs = defaultdict(list)  # uid -> list of reward lists (one per unique trajectory)
+        seen_pairs = set()
+
+        for i in range(bsz):
+            idx = index[i]
+            pair = (idx, traj_index[i])
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+            group_trajs[idx].append(r_hat[i])
+
+        # ── Step 3: Compute discounted returns per trajectory ──────────
+        # Discounted return (dc_grpo_v2.md "Exact Decomposition"):
+        #   R_{i,t} = r_{i,t} + γ · R_{i,t+1}
+        #   R_{i,T+1} = 0  (boundary condition)
+        # Computed backward: for t = T, T-1, ..., 1
+        group_returns = {}  # uid -> list of return lists (one per trajectory)
+        for idx, trajs in group_trajs.items():
+            returns_list = []
+            for rewards_i in trajs:
+                T_i = len(rewards_i)
+                R_i = [0.0] * (T_i + 1)  # R_{i,T+1} = 0
+                for t in reversed(range(T_i)):
+                    R_i[t] = rewards_i[t] + gamma * R_i[t + 1]
+                returns_list.append(R_i[:T_i])  # drop the boundary sentinel
+            group_returns[idx] = returns_list
+
+        # ── Step 4: Compute per-turn statistics across group ───────────
+        # Per-turn immediate reward statistics (dc_grpo_v2.md "Notation"):
+        #   μ^r_t = (1/G) Σ_j r_{j,t}   — group mean of immediate rewards at turn t
+        #   σ^r_t = std_j(r_{j,t})        — group std of immediate rewards at turn t
+        #
+        # Per-turn discounted return statistics:
+        #   μ^R_t = (1/G) Σ_j R_{j,t}   — group mean of returns from turn t
+        #   σ^R_t = std_j(R_{j,t})        — group std of returns from turn t
+        group_stats = {}  # uid -> {mu_r, sigma_r, mu_R, sigma_R} per turn
+        for idx, trajs in group_trajs.items():
+            rets = group_returns[idx]
+            # Find max turn length across trajectories in this group
+            max_T = max(len(tr) for tr in trajs)
+            mu_r = []
+            sigma_r = []
+            mu_R = []
+            sigma_R = []
+            for t in range(max_T):
+                # Collect immediate rewards at turn t from trajectories that reached turn t
+                r_at_t = [trajs[j][t] for j in range(len(trajs)) if t < len(trajs[j])]
+                R_at_t = [rets[j][t] for j in range(len(rets)) if t < len(rets[j])]
+
+                # Use float64 to match Python float precision in entry_returns
+                r_tensor = torch.tensor(r_at_t, dtype=torch.float64)
+                R_tensor = torch.tensor(R_at_t, dtype=torch.float64)
+
+                mu_r.append(r_tensor.mean().item())
+                sigma_r.append(r_tensor.std().item() if len(r_at_t) > 1 else 0.0)
+                mu_R.append(R_tensor.mean().item())
+                sigma_R.append(R_tensor.std().item() if len(R_at_t) > 1 else 0.0)
+
+            group_stats[idx] = {
+                "mu_r": mu_r,
+                "sigma_r": sigma_r,
+                "mu_R": mu_R,
+                "sigma_R": sigma_R,
+            }
+
+        # ── Step 5: DC-GRPO advantage per trajectory per turn ──────────
+        # DC-GRPO advantage (dc_grpo_v2.md "Method C: DC-GRPO"):
+        #   I_{i,t} = (r_{i,t} - μ^r_t) / (σ^r_t + ε)         — immediate credit
+        #   F_{i,t} = γ · (R_{i,t+1} - μ^R_{t+1}) / (σ^R_{t+1} + ε)  — future credit
+        #   A_{i,t} = I_{i,t} + F_{i,t}
+        #
+        # Last turn (t = T):
+        #   A_{i,T} = I_{i,T} = (r_{i,T} - μ^r_T) / (σ^r_T + ε)
+
+        # Build per-batch-entry return lists (needed for F_{i,t})
+        # Map each batch entry to its position within its group
+        entry_returns = []
+        seen_pairs2 = set()
+        traj_counter = defaultdict(int)  # uid -> count of unique trajs seen so far
+        entry_traj_idx = []  # which trajectory index within group for each batch entry
+        for i in range(bsz):
+            idx = index[i]
+            pair = (idx, traj_index[i])
+            if pair not in seen_pairs2:
+                seen_pairs2.add(pair)
+                traj_counter[pair] = len([p for p in seen_pairs2 if p[0] == idx]) - 1
+            entry_traj_idx.append(traj_counter[pair])
+
+            # Compute returns for this entry's rewards
+            T_i = len(r_hat[i])
+            R_i = [0.0] * (T_i + 1)
+            for t in reversed(range(T_i)):
+                R_i[t] = r_hat[i][t] + gamma * R_i[t + 1]
+            entry_returns.append(R_i)
+
+        # Pass 1: Compute standard DC-GRPO advantages and track refusal positions
+        A_dc = []
+        I_cache = []  # cache I_{i,t} for refusal turns (pass 2)
+        refusal_positions = []  # (i, t) pairs where r_{i,t} == -1
+
+        for i in range(bsz):
+            idx = index[i]
+            stats = group_stats[idx]
+            T_i = len(r_hat[i])
+            A_i = [0.0] * T_i
+            I_i = [0.0] * T_i
+
+            for t in range(T_i):
+                # I_{i,t} = (r_{i,t} - μ^r_t) / (σ^r_t + ε)  — immediate credit
+                if norm_adv_by_std_in_grpo:
+                    I_it = (r_hat[i][t] - stats["mu_r"][t]) / (stats["sigma_r"][t] + epsilon)
+                else:
+                    I_it = r_hat[i][t] - stats["mu_r"][t]
+                I_i[t] = I_it
+
+                if r_hat[i][t] == -1.0:
+                    # Mark for pass 2; temporarily set to 0 (won't affect batch_floor)
+                    A_i[t] = 0.0
+                    refusal_positions.append((i, t))
+                elif t < T_i - 1:
+                    # F_{i,t} = (R_{i,t+1} - μ^R_{t+1}) / (σ^R_{t+1} + ε)  — future credit
+                    # A_{i,t} = I_{i,t} + α · F_{i,t}
+                    R_future = entry_returns[i][t + 1]  # R_{i,t+1}
+                    if norm_adv_by_std_in_grpo:
+                        F_it = (R_future - stats["mu_R"][t + 1]) / (stats["sigma_R"][t + 1] + epsilon)
+                    else:
+                        F_it = R_future - stats["mu_R"][t + 1]
+                    A_i[t] = I_it + alpha * F_it
+                else:
+                    # Last turn (t = T): A_{i,T} = I_{i,T}
+                    A_i[t] = I_it
+
+            A_dc.append(A_i)
+            I_cache.append(I_i)
+
+        # Pass 2: Refusal penalty override
+        # Refusal turns must receive a STRONGER penalty than the worst non-refusal.
+        #   batch_floor = min(non-refusal advantages)
+        #   penalty = min(batch_floor - margin, refusal_penalty_floor)
+        #     → margin ensures refusal is strictly worse than any non-refusal
+        #     → refusal_penalty_floor (-1.0) guarantees minimum penalty in early
+        #       training when most turns are refusals and batch_floor is unreliable
+        #   A_{i,t} = min(I_{i,t}, penalty)
+        if refusal_positions:
+            refusal_set = set(refusal_positions)
+            non_refusal_advs = []
+            for i in range(bsz):
+                for t in range(len(A_dc[i])):
+                    if (i, t) not in refusal_set:
+                        non_refusal_advs.append(A_dc[i][t])
+
+            margin = 1.0
+            if non_refusal_advs:
+                batch_floor = min(non_refusal_advs)
+                penalty = min(batch_floor - margin, refusal_penalty_floor)
+            else:
+                penalty = refusal_penalty_floor
+
+            for (i, t) in refusal_positions:
+                A_dc[i][t] = min(I_cache[i][t], penalty)
+
+        # ── Step 6: Turn → Token mapping via step_index ────────────────
+        max_tokens = response_mask.shape[1]
+        token_advantages = torch.zeros(
+            (bsz, max_tokens), dtype=torch.float32, device=response_mask.device
+        )
+
+        if step_index is not None:
+            # Fixed mapping: each batch entry corresponds to one step (turn).
+            # Assign that turn's advantage uniformly to all response tokens.
+            for i in range(bsz):
+                step_idx = int(step_index[i])
+                if step_idx < len(A_dc[i]):
+                    token_advantages[i, :] = A_dc[i][step_idx]
+        else:
+            # Fallback: use turn_token_mask for per-token mapping
+            for i in range(bsz):
+                mask = turn_token_mask[i]
+                for pos, t in enumerate(mask):
+                    if pos >= max_tokens:
+                        break
+                    if t >= 0 and t < len(A_dc[i]):
+                        token_advantages[i, pos] = A_dc[i][t]
+
+        # Apply response_mask to zero out padded areas
+        token_advantages = token_advantages * response_mask
+
+    return token_advantages, token_advantages, A_dc
+
+
 def compute_grpo_passk_outcome_advantage(
     token_level_rewards: torch.Tensor,
     response_mask: torch.Tensor,

@@ -102,6 +102,7 @@ class AdvantageEstimator(str, Enum):
     GRPO_PASSK = "grpo_passk"
     GiGPO = "gigpo"
     MULTITURN_GRPO = "multiturn_grpo"
+    DC_GRPO = "dc_grpo"
 
 
 @dataclass
@@ -438,6 +439,155 @@ def _validate_multiturn_grpo_advantage(data, gamma, lambda_div, norm_adv_by_std_
     print("[HOOK 1] PASSED: Multi-turn GRPO advantage independent re-computation matches.")
 
 
+def _validate_dc_grpo_advantage(data, gamma, lambda_div, norm_adv_by_std_in_grpo):
+    """Hook 1-DC: Independent re-computation of DC-GRPO advantages.
+
+    Re-implements the same logic as core_algos.compute_dc_grpo_advantage()
+    and compares results against data.batch["advantages"] and
+    data.non_tensor_batch["turn_advantages"].
+    Raises AssertionError on any mismatch.
+    """
+    epsilon = 1e-8
+
+    turn_rewards = data.non_tensor_batch["turn_rewards"].tolist()
+    turn_token_mask = data.non_tensor_batch["turn_token_mask"].tolist()
+    step_index_list = data.non_tensor_batch["step_index"].tolist()
+    index = data.non_tensor_batch["uid"]
+    traj_index = data.non_tensor_batch["traj_uid"]
+    bsz = len(turn_rewards)
+
+    grpo_mask = data.batch["response_mask"]
+    if "loss_mask" in data.batch:
+        response_length = grpo_mask.size(1)
+        grpo_mask = data.batch["loss_mask"][:, -response_length:]
+
+    # Step 1: r_hat (diversity augmentation)
+    r_hat = []
+    for i in range(bsz):
+        r_hat_i = []
+        for t in range(len(turn_rewards[i])):
+            div_bonus = 0.0 if lambda_div == 0 else 1.0
+            r_hat_i.append(turn_rewards[i][t] + lambda_div * div_bonus)
+        r_hat.append(r_hat_i)
+
+    # Step 2: Group trajectories by uid, deduplicate by (uid, traj_uid)
+    group_trajs = defaultdict(list)
+    seen_pairs = set()
+    for i in range(bsz):
+        idx = index[i]
+        pair = (idx, traj_index[i])
+        if pair in seen_pairs:
+            continue
+        seen_pairs.add(pair)
+        group_trajs[idx].append(r_hat[i])
+
+    # Step 3: Compute discounted returns per trajectory
+    group_returns = {}
+    for idx, trajs in group_trajs.items():
+        returns_list = []
+        for rewards_i in trajs:
+            T_i = len(rewards_i)
+            R_i = [0.0] * (T_i + 1)
+            for t in reversed(range(T_i)):
+                R_i[t] = rewards_i[t] + gamma * R_i[t + 1]
+            returns_list.append(R_i[:T_i])
+        group_returns[idx] = returns_list
+
+    # Step 4: Per-turn statistics
+    group_stats = {}
+    for idx, trajs in group_trajs.items():
+        rets = group_returns[idx]
+        max_T = max(len(tr) for tr in trajs)
+        mu_r, sigma_r, mu_R, sigma_R = [], [], [], []
+        for t in range(max_T):
+            r_at_t = [trajs[j][t] for j in range(len(trajs)) if t < len(trajs[j])]
+            R_at_t = [rets[j][t] for j in range(len(rets)) if t < len(rets[j])]
+            r_tensor = torch.tensor(r_at_t, dtype=torch.float64)
+            R_tensor = torch.tensor(R_at_t, dtype=torch.float64)
+            mu_r.append(r_tensor.mean().item())
+            sigma_r.append(r_tensor.std().item() if len(r_at_t) > 1 else 0.0)
+            mu_R.append(R_tensor.mean().item())
+            sigma_R.append(R_tensor.std().item() if len(R_at_t) > 1 else 0.0)
+        group_stats[idx] = {"mu_r": mu_r, "sigma_r": sigma_r, "mu_R": mu_R, "sigma_R": sigma_R}
+
+    # Step 5: DC-GRPO advantage
+    # Compute per-entry returns
+    entry_returns = []
+    for i in range(bsz):
+        T_i = len(r_hat[i])
+        R_i = [0.0] * (T_i + 1)
+        for t in reversed(range(T_i)):
+            R_i[t] = r_hat[i][t] + gamma * R_i[t + 1]
+        entry_returns.append(R_i)
+
+    A_dc = []
+    for i in range(bsz):
+        idx = index[i]
+        stats = group_stats[idx]
+        T_i = len(r_hat[i])
+        A_i = [0.0] * T_i
+        for t in range(T_i):
+            if norm_adv_by_std_in_grpo:
+                I_it = (r_hat[i][t] - stats["mu_r"][t]) / (stats["sigma_r"][t] + epsilon)
+            else:
+                I_it = r_hat[i][t] - stats["mu_r"][t]
+            if t < T_i - 1:
+                R_future = entry_returns[i][t + 1]
+                if norm_adv_by_std_in_grpo:
+                    F_it = gamma * (R_future - stats["mu_R"][t + 1]) / (stats["sigma_R"][t + 1] + epsilon)
+                else:
+                    F_it = gamma * (R_future - stats["mu_R"][t + 1])
+                A_i[t] = I_it + F_it
+            else:
+                A_i[t] = I_it
+        A_dc.append(A_i)
+
+    # Step 6: step_index → token mapping + grpo_mask
+    max_tokens = grpo_mask.shape[1]
+    recomputed = torch.zeros((bsz, max_tokens), dtype=torch.float32, device=grpo_mask.device)
+    for i in range(bsz):
+        step_idx = int(step_index_list[i])
+        if step_idx < len(A_dc[i]):
+            recomputed[i, :] = A_dc[i][step_idx]
+    recomputed = recomputed * grpo_mask
+
+    # Compare token-level advantages
+    actual_adv = data.batch["advantages"]
+    if not torch.allclose(recomputed, actual_adv, atol=1e-5, rtol=1e-4):
+        mismatch = ~torch.isclose(recomputed, actual_adv, atol=1e-5, rtol=1e-4)
+        rows, cols = torch.where(mismatch)
+        n_mismatch = rows.numel()
+        diag_lines = [f"[HOOK 1-DC] FAILED: {n_mismatch} mismatched positions"]
+        for k in range(min(10, n_mismatch)):
+            r, c = rows[k].item(), cols[k].item()
+            diag_lines.append(
+                f"  row={r}, col={c}: recomputed={recomputed[r, c].item():.6f}, "
+                f"actual={actual_adv[r, c].item():.6f}, "
+                f"raw_rewards={turn_rewards[r]}, A_dc={A_dc[r]}"
+            )
+        raise AssertionError("\n".join(diag_lines))
+
+    # Compare turn-level advantages
+    actual_turn_adv = data.non_tensor_batch["turn_advantages"]
+    for i in range(bsz):
+        for t in range(len(A_dc[i])):
+            if abs(A_dc[i][t] - actual_turn_adv[i][t]) > 1e-5:
+                raise AssertionError(
+                    f"[HOOK 1-DC] FAILED: turn_advantages mismatch at row={i}, turn={t}: "
+                    f"recomputed={A_dc[i][t]:.6f}, actual={actual_turn_adv[i][t]:.6f}"
+                )
+
+    # Verify mask: grpo_mask==0 → advantage==0
+    zero_mask = grpo_mask == 0
+    if (actual_adv[zero_mask] != 0).any():
+        bad = torch.where(zero_mask & (actual_adv != 0))
+        raise AssertionError(
+            f"[HOOK 1-DC] FAILED: {bad[0].numel()} positions have non-zero advantage where grpo_mask==0"
+        )
+
+    print("[HOOK 1-DC] PASSED: DC-GRPO advantage independent re-computation matches.")
+
+
 def _validate_advantages_before_actor(data):
     """Hook 2: Validate advantage data integrity before actor update.
 
@@ -658,6 +808,39 @@ def compute_advantage(
         data.non_tensor_batch["turn_advantages"] = np.array(
             turn_advantages, dtype=object
         )
+    elif adv_estimator == AdvantageEstimator.DC_GRPO:
+        # DC-GRPO: Decomposed Credit GRPO (Method C from dc_grpo_v2.md)
+        all_turn_rewards = data.non_tensor_batch["turn_rewards"].tolist()
+        all_turn_texts = data.non_tensor_batch["turn_texts"].tolist()
+        all_token_masks = data.non_tensor_batch["turn_token_mask"].tolist()
+        all_step_index = data.non_tensor_batch["step_index"].tolist()
+
+        grpo_mask = data.batch["response_mask"]
+        if "loss_mask" in data.batch:
+            response_length = grpo_mask.size(1)
+            grpo_mask = data.batch["loss_mask"][:, -response_length:]
+
+        advantages, returns, turn_advantages = (
+            core_algos.compute_dc_grpo_advantage(
+                turn_rewards=all_turn_rewards,
+                turn_texts=all_turn_texts,
+                turn_token_mask=all_token_masks,
+                response_mask=grpo_mask,
+                index=data.non_tensor_batch["uid"],
+                traj_index=data.non_tensor_batch["traj_uid"],
+                step_index=all_step_index,
+                gamma=gamma,
+                alpha=kwargs.get("alpha", None),
+                refusal_penalty_floor=kwargs.get("refusal_penalty_floor", -1.0),
+                lambda_div=kwargs.get("lambda_div", 0.1),
+                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            )
+        )
+        data.batch["advantages"] = advantages
+        data.batch["returns"] = returns
+        data.non_tensor_batch["turn_advantages"] = np.array(
+            turn_advantages, dtype=object
+        )
     else:
         raise NotImplementedError
     return data
@@ -758,6 +941,7 @@ class RayPPOTrainer:
             AdvantageEstimator.REINFORCE_PLUS_PLUS_BASELINE,
             AdvantageEstimator.GiGPO,
             AdvantageEstimator.MULTITURN_GRPO,
+            AdvantageEstimator.DC_GRPO,
         ]:
             self.use_critic = False
         else:
@@ -926,7 +1110,8 @@ class RayPPOTrainer:
             assert config.algorithm.adv_estimator in [
                 AdvantageEstimator.GRPO,
                 AdvantageEstimator.MULTITURN_GRPO,
-            ], "only GRPO and MULTITURN_GRPO are supported for multi-turn rollout currently"
+                AdvantageEstimator.DC_GRPO,
+            ], "only GRPO, MULTITURN_GRPO, and DC_GRPO are supported for multi-turn rollout currently"
 
         print("[validate_config] All configuration checks passed successfully!")
 
@@ -1079,7 +1264,15 @@ class RayPPOTrainer:
         data_source_lst = []
         tool_calling_list = []
         traj_uid_list = []
+        uid_list = []
         success_rate_dict = {}
+
+        # Multi-turn data accumulators (mirrors compute_data_metrics fields)
+        all_turn_rewards = []
+        all_turn_token_mask = []
+        all_episode_rewards = []
+        all_episode_lengths = []
+        all_format_rewards = []
 
         # Lists to collect samples for the table
         sample_inputs = []
@@ -1178,6 +1371,21 @@ class RayPPOTrainer:
                 test_output_gen_batch.non_tensor_batch["tool_callings"]
             )
             traj_uid_list.append(test_output_gen_batch.non_tensor_batch["traj_uid"])
+            uid_list.append(test_output_gen_batch.non_tensor_batch.get("uid", np.array(["unknown"] * reward_tensor.shape[0])))
+
+            # Accumulate multi-turn data for rich metrics
+            ntb = test_output_gen_batch.non_tensor_batch
+            if "turn_rewards" in ntb:
+                all_turn_rewards.append(ntb["turn_rewards"])
+            if "turn_token_mask" in ntb:
+                all_turn_token_mask.append(ntb["turn_token_mask"])
+            if "episode_rewards" in ntb:
+                all_episode_rewards.append(ntb["episode_rewards"])
+            if "episode_lengths" in ntb:
+                all_episode_lengths.append(ntb["episode_lengths"])
+            if "format_rewards" in ntb:
+                all_format_rewards.append(ntb["format_rewards"])
+
             # success rate
             for k in test_batch.non_tensor_batch.keys():
                 if "success_rate" in k:
@@ -1201,7 +1409,11 @@ class RayPPOTrainer:
         data_sources = np.concatenate(data_source_lst, axis=0)
         tool_callings = np.concatenate(tool_calling_list, axis=0)
         traj_uids = np.concatenate(traj_uid_list, axis=0)
+        uids = np.concatenate(uid_list, axis=0)
         success_rate = {k: np.mean(v) for k, v in success_rate_dict.items()}
+
+        # Deduplicate by traj_uid (same as training's compute_data_metrics)
+        unique_traj_uid, unique_idx = np.unique(traj_uids, return_index=True)
 
         # evaluate test_score based on data source
         data_source_reward = {}
@@ -1214,7 +1426,6 @@ class RayPPOTrainer:
         # evaluate tool call based on data source
         # the values in tool_callings represent the tool call count for each trajectory; however, since the batch is expanded by step, we only need to take one value for each unique trajectories.
         data_source_tool_calling = {}
-        unique_traj_uid, unique_idx = np.unique(traj_uids, return_index=True)
         unique_data_sources = data_sources[unique_idx]
         unique_tool_callings = tool_callings[unique_idx]
 
@@ -1230,11 +1441,113 @@ class RayPPOTrainer:
 
         for data_source, tool_calls in data_source_tool_calling.items():
             metric_dict[f"val/{data_source}/tool_call_count/mean"] = np.mean(tool_calls)
-            # metric_dict[f'val/{data_source}/tool_call_count/max'] = np.max(tool_calls)
-            # metric_dict[f'val/{data_source}/tool_call_count/min'] = np.min(tool_calls)
 
         for k, v in success_rate.items():
             metric_dict[f"val/{k}"] = v
+
+        # ── Rich multi-turn metrics (mirrors compute_data_metrics) ──────
+        # Episode-level metrics
+        if all_episode_rewards:
+            ep_rewards = np.concatenate(all_episode_rewards, axis=0)[unique_idx]
+            metric_dict["val/episode/reward/mean"] = float(np.mean(ep_rewards))
+            metric_dict["val/episode/reward/max"] = float(np.max(ep_rewards))
+            metric_dict["val/episode/reward/min"] = float(np.min(ep_rewards))
+        if all_episode_lengths:
+            ep_lengths = np.concatenate(all_episode_lengths, axis=0)[unique_idx]
+            metric_dict["val/episode/length/mean"] = float(np.mean(ep_lengths))
+            metric_dict["val/episode/length/max"] = float(np.max(ep_lengths))
+            metric_dict["val/episode/length/min"] = float(np.min(ep_lengths))
+
+        metric_dict["val/episode/tool_call_count/mean"] = float(np.mean(unique_tool_callings))
+
+        # Multi-turn reward metrics
+        if all_turn_rewards:
+            turn_rewards_concat = np.concatenate(all_turn_rewards, axis=0)[unique_idx]
+            unique_uids = uids[unique_idx]
+
+            all_rewards_lists = []
+            for traj_rewards in turn_rewards_concat:
+                all_rewards_lists.append(
+                    traj_rewards if isinstance(traj_rewards, list) else traj_rewards.tolist()
+                )
+
+            # Per-turn reward stats
+            turn_buckets = defaultdict(list)
+            for rewards_list in all_rewards_lists:
+                for t, r in enumerate(rewards_list):
+                    turn_buckets[t].append(r)
+            for t in sorted(turn_buckets.keys()):
+                vals = turn_buckets[t]
+                metric_dict[f"val/turn_reward/turn_{t+1}/mean"] = float(np.mean(vals))
+                metric_dict[f"val/turn_reward/turn_{t+1}/std"] = float(np.std(vals))
+                metric_dict[f"val/turn_reward/turn_{t+1}/max"] = float(np.max(vals))
+                metric_dict[f"val/turn_reward/turn_{t+1}/min"] = float(np.min(vals))
+
+            # Episode success rate (per-trajectory, across entire val dataset)
+            success_threshold = 0.9
+            successes = [float(max(rl) >= success_threshold) for rl in all_rewards_lists if len(rl) > 0]
+            if successes:
+                metric_dict["val/episode/success_rate"] = float(np.mean(successes))
+                metric_dict["val/episode/num_trajectories"] = float(len(successes))
+
+            # GRPO group reward std
+            uid_to_episode_rewards = defaultdict(list)
+            for uid, rewards_list in zip(unique_uids, all_rewards_lists):
+                uid_to_episode_rewards[uid].append(sum(rewards_list))
+            group_stds = [float(np.std(rs)) for rs in uid_to_episode_rewards.values() if len(rs) > 1]
+            if group_stds:
+                metric_dict["val/grpo/group_reward_std/mean"] = float(np.mean(group_stds))
+                metric_dict["val/grpo/group_reward_std/min"] = float(np.min(group_stds))
+                metric_dict["val/grpo/group_reward_std/max"] = float(np.max(group_stds))
+
+            # Reward delta (last turn - first turn)
+            deltas = [rl[-1] - rl[0] for rl in all_rewards_lists if len(rl) >= 2]
+            if deltas:
+                metric_dict["val/turn_reward/delta_last_first/mean"] = float(np.mean(deltas))
+                metric_dict["val/turn_reward/delta_last_first/std"] = float(np.std(deltas))
+
+            # Best-of-N episode reward
+            best_of_n = [float(max(rs)) for rs in uid_to_episode_rewards.values()]
+            if best_of_n:
+                metric_dict["val/episode/reward/best_of_n"] = float(np.mean(best_of_n))
+
+        # Per-turn response length
+        if all_turn_token_mask:
+            turn_masks_concat = np.concatenate(all_turn_token_mask, axis=0)[unique_idx]
+            turn_len_buckets = defaultdict(list)
+            for tmask in turn_masks_concat:
+                mask_list = tmask if isinstance(tmask, list) else tmask.tolist()
+                turn_counts = defaultdict(int)
+                for turn_idx in mask_list:
+                    turn_counts[turn_idx] += 1
+                for t, count in turn_counts.items():
+                    turn_len_buckets[t].append(count)
+            for t in sorted(turn_len_buckets.keys()):
+                vals = turn_len_buckets[t]
+                metric_dict[f"val/turn_response_length/turn_{t+1}/mean"] = float(np.mean(vals))
+                metric_dict[f"val/turn_response_length/turn_{t+1}/std"] = float(np.std(vals))
+
+        # Format reward metrics
+        if all_format_rewards:
+            fmt_concat = np.concatenate(all_format_rewards, axis=0)[unique_idx]
+            all_format_lists = []
+            for fr in fmt_concat:
+                all_format_lists.append(
+                    fr if isinstance(fr, list) else fr.tolist()
+                )
+            all_scores = [s for fl in all_format_lists for s in fl]
+            if all_scores:
+                metric_dict["val/format_reward/mean"] = float(np.mean(all_scores))
+                metric_dict["val/format_reward/valid_format_ratio"] = float(
+                    np.mean([1.0 if s == 1.0 else 0.0 for s in all_scores])
+                )
+                fmt_turn_buckets = defaultdict(list)
+                for fl in all_format_lists:
+                    for t, s in enumerate(fl):
+                        fmt_turn_buckets[t].append(s)
+                for t in sorted(fmt_turn_buckets.keys()):
+                    vals = fmt_turn_buckets[t]
+                    metric_dict[f"val/format_reward/turn_{t+1}/mean"] = float(np.mean(vals))
 
         return metric_dict
 
@@ -1805,6 +2118,8 @@ class RayPPOTrainer:
                             gigpo_enable_similarity=self.config.algorithm.gigpo.enable_similarity,
                             gigpo_similarity_thresh=self.config.algorithm.gigpo.similarity_thresh,
                             lambda_div=self.config.algorithm.get("lambda_div", 0.1),
+                            alpha=self.config.algorithm.get("alpha", None),
+                            refusal_penalty_floor=self.config.algorithm.get("refusal_penalty_floor", -1.0),
                         )
 
                         # Hook 1: Validate multi-turn GRPO advantage via independent re-computation
@@ -1813,6 +2128,18 @@ class RayPPOTrainer:
                             and self.config.algorithm.adv_estimator == "multiturn_grpo"
                         ):
                             _validate_multiturn_grpo_advantage(
+                                data=batch,
+                                gamma=self.config.algorithm.gamma,
+                                lambda_div=self.config.algorithm.get("lambda_div", 0.1),
+                                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                            )
+
+                        # Hook 1-DC: Validate DC-GRPO advantage via independent re-computation
+                        if (
+                            self.config.trainer.get("debug_validate_pipeline", False)
+                            and self.config.algorithm.adv_estimator == "dc_grpo"
+                        ):
+                            _validate_dc_grpo_advantage(
                                 data=batch,
                                 gamma=self.config.algorithm.gamma,
                                 lambda_div=self.config.algorithm.get("lambda_div", 0.1),

@@ -13,6 +13,7 @@ set -euo pipefail
 
 # ==========================================================
 # Multi-Turn GRPO Training Script (6 GPU: 2 vLLM + 4 Actor)
+# Resume from checkpoint
 # ==========================================================
 
 # --- SLURM environment ---
@@ -51,10 +52,10 @@ if [ -n "${SLURM_JOB_ID:-}" ]; then
     export CUDA_CACHE_PATH=$BASE/cuda_cache
     export PIP_CACHE_DIR=$BASE/pip_cache
     export TMPDIR=$BASE/tmp
-    mkdir -p $WANDB_DIR $TORCH_EXTENSIONS_DIR $CUDA_CACHE_PATH $PIP_CACHE_DIR $TMPDIR $BASE/ray
+    mkdir -p "$WANDB_DIR" "$TORCH_EXTENSIONS_DIR" "$CUDA_CACHE_PATH" "$PIP_CACHE_DIR" "$TMPDIR" "$BASE/ray"
     # Symlink for Ray: AF_UNIX socket path must be < 107 bytes
     rm -f /tmp/ray_short
-    ln -sf $BASE/ray /tmp/ray_short
+    ln -sf "$BASE/ray" /tmp/ray_short
     echo "📁 Ray temp: /tmp/ray_short -> $BASE/ray"
     echo "📁 Using local scratch: $BASE"
 fi
@@ -67,7 +68,7 @@ sleep 2
 # --- Config ---
 train_data_size=520
 train_batch_size=4
-val_data_size=2
+val_data_size=100
 group_size=10
 lambda_div=0.0
 ADV_METHOD=${ADV_METHOD:-dcgrpo}  # normdiscount | dcgrpo
@@ -89,19 +90,20 @@ ppo_mini_batch_size=$((train_batch_size * group_size))
 steps_per_epoch=$((train_data_size / train_batch_size))
 total_epochs=8
 total_training_steps=$((total_epochs * steps_per_epoch))
-#total_training_steps=1
 
-# --- Project ---
+# --- Paths / Project ---
+SCRIPT_DIR="/home2/pjy0422/workspace/verl-agent/examples/multiturn_grpo_trainer"
 export project_name="verl_agent_multiturn"
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-export experiment_name="multiturn_${ADV_METHOD}_qwen3_4b_4gpu_${TIMESTAMP}"
-export OUTPUT="./outputs/${project_name}/${experiment_name}"
-export EVAL_LOG_PATH="./eval_logs/${project_name}/${experiment_name}"
-mkdir -p $OUTPUT $EVAL_LOG_PATH ./logs
+export experiment_name="multiturn_dcgrpo_qwen3_4b_4gpu_20260318_183502"
+
+export OUTPUT="${SCRIPT_DIR}/outputs/${project_name}/${experiment_name}"
+export EVAL_LOG_PATH="${SCRIPT_DIR}/eval_logs/${project_name}/${experiment_name}"
+export RESUME_CKPT="${SCRIPT_DIR}/outputs/${project_name}/${experiment_name}/global_step_390"
+
+mkdir -p "$OUTPUT" "$EVAL_LOG_PATH" "${SCRIPT_DIR}/logs"
 
 # Prepare jailbreak behavior data
 echo "🔧 Preparing jailbreak behavior data..."
-SCRIPT_DIR="/home2/pjy0422/workspace/verl-agent/examples/multiturn_grpo_trainer"
 cd "$SCRIPT_DIR"
 python3 "$SCRIPT_DIR/prepare_jailbreak_data.py" \
     --local_dir "$HOME/data/verl-agent/jailbreak" \
@@ -113,32 +115,32 @@ VAL_DATA="$HOME/data/verl-agent/jailbreak/test.parquet"
 MODEL_PATH="Qwen/Qwen3-4B-Instruct-2507"
 
 # --- GPU Assignment (relative to SLURM allocation) ---
-# Parse SLURM-allocated GPUs to get physical IDs
 IFS=',' read -ra GPUS <<< "${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5}"
 TARGET_GPU=${GPUS[0]}
 JUDGE_GPU=${GPUS[1]}
 ACTOR_GPUS="${GPUS[2]},${GPUS[3]},${GPUS[4]},${GPUS[5]}"
+
 TARGET_PORT=9011
 JUDGE_PORT=9012
 TARGET_MODEL="meta-llama/Llama-3.1-8B-Instruct"
 JUDGE_MODEL="Qwen/Qwen3Guard-Gen-8B"
 MAX_TURNS=5
-#PROMPT_TYPE=${PROMPT_TYPE:-json}
 FORMAT_REWARD_COEF=${FORMAT_REWARD_COEF:-0.1}
-PROMPT_TYPE=xml  # Uncomment to use XML format (<reasoning>/<answer> tags) with format reward bonus
+PROMPT_TYPE=xml
 
 LOG_DIR="${SCRIPT_DIR}/logs_mtjailbreak"
 mkdir -p "$LOG_DIR"
 
 echo "=============================================="
-echo " MultiTurnConvEnv GRPO Training (4 GPU)      "
+echo " MultiTurnConvEnv GRPO Training (4 GPU)       "
 echo "=============================================="
-echo " Actor    : $MODEL_PATH          (GPU $ACTOR_GPUS)"
-echo " Target   : $TARGET_MODEL        (GPU $TARGET_GPU)"
-echo " Judge    : $JUDGE_MODEL         (GPU $JUDGE_GPU)"
-echo " Prompt   : $PROMPT_TYPE"
-echo " Max Turns: $MAX_TURNS"
+echo " Actor     : $MODEL_PATH          (GPU $ACTOR_GPUS)"
+echo " Target    : $TARGET_MODEL        (GPU $TARGET_GPU)"
+echo " Judge     : $JUDGE_MODEL         (GPU $JUDGE_GPU)"
+echo " Prompt    : $PROMPT_TYPE"
+echo " Max Turns : $MAX_TURNS"
 echo " Adv Method: $ADV_METHOD ($ADV_ESTIMATOR)"
+echo " Resume CKPT: $RESUME_CKPT"
 echo "=============================================="
 
 # ===========================================================
@@ -178,13 +180,10 @@ wait_for_server() {
 
 cleanup() {
     echo "🛑 Cleaning up servers..."
-    # Kill all child processes of this script (includes setsid descendants)
     pkill -P $$ 2>/dev/null || true
-    # Kill vLLM processes by port (catches all workers, not just the main process)
     kill_port $TARGET_PORT
     kill_port $JUDGE_PORT
     sleep 2
-    # Fallback: kill any remaining vLLM serve processes we started
     pkill -f "vllm serve.*$TARGET_MODEL" 2>/dev/null || true
     pkill -f "vllm serve.*$JUDGE_MODEL" 2>/dev/null || true
     sleep 1
@@ -213,7 +212,7 @@ setsid bash -c "CUDA_VISIBLE_DEVICES=$JUDGE_GPU vllm serve \"$JUDGE_MODEL\" \
     > \"$LOG_DIR/judge.log\" 2>&1" &
 JUDGE_PID=$!
 
-wait_for_server $JUDGE_PORT  "Judge"  $JUDGE_PID  600
+wait_for_server $JUDGE_PORT "Judge" $JUDGE_PID 600
 wait_for_server $TARGET_PORT "Target" $TARGET_PID 600
 
 echo "✨ All servers UP!"
@@ -222,7 +221,7 @@ echo "✨ All servers UP!"
 # 2. Run Multi-Turn GRPO Training
 # ===========================================================
 echo ""
-echo "🚀 Starting Multi-Turn GRPO Training..."
+echo "🚀 Starting Multi-Turn GRPO Training from checkpoint..."
 
 export CUDA_VISIBLE_DEVICES=$ACTOR_GPUS
 
@@ -239,7 +238,6 @@ python3 -m verl.trainer.main_ppo --config-name=mtjailbreak \
     actor_rollout_ref.model.use_remove_padding=true \
     actor_rollout_ref.model.enable_gradient_checkpointing=true \
     \
-    `# === Memory Optimization: Actor ===` \
     actor_rollout_ref.actor.use_dynamic_bsz=true \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=12288 \
     actor_rollout_ref.actor.ppo_mini_batch_size=$ppo_mini_batch_size \
@@ -258,7 +256,6 @@ python3 -m verl.trainer.main_ppo --config-name=mtjailbreak \
     actor_rollout_ref.actor.invalid_action_penalty_coef=0.0 \
     actor_rollout_ref.actor.ulysses_sequence_parallel_size=1 \
     \
-    `# === Memory Optimization: Rollout (vLLM) ===` \
     actor_rollout_ref.rollout.name=$ENGINE \
     actor_rollout_ref.rollout.tensor_model_parallel_size=2 \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
@@ -276,7 +273,6 @@ python3 -m verl.trainer.main_ppo --config-name=mtjailbreak \
     actor_rollout_ref.ref.fsdp_config.param_offload=true \
     actor_rollout_ref.actor.checkpoint.contents='[model,optimizer,extra,hf_model]' \
     \
-    `# === Algorithm ===` \
     algorithm.adv_estimator=$ADV_ESTIMATOR \
     algorithm.gamma=$GAMMA \
     +algorithm.alpha=$ALPHA \
@@ -285,7 +281,6 @@ python3 -m verl.trainer.main_ppo --config-name=mtjailbreak \
     algorithm.use_kl_in_reward=false \
     algorithm.kl_ctrl.kl_coef=0.001 \
     \
-    `# === Environment ===` \
     env.prompt_type=$PROMPT_TYPE \
     env.format_reward_coef=$FORMAT_REWARD_COEF \
     env.max_steps=$MAX_TURNS \
@@ -295,20 +290,20 @@ python3 -m verl.trainer.main_ppo --config-name=mtjailbreak \
     env.judge.port=$JUDGE_PORT \
     env.judge.model=$JUDGE_MODEL \
     \
-    `# === Trainer ===` \
     trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
     trainer.project_name=${project_name} \
     trainer.experiment_name=${experiment_name} \
     trainer.logger='[console,wandb]' \
     trainer.val_before_train=false \
-    trainer.save_freq=33 \
+    trainer.save_freq=130 \
     trainer.test_freq=65 \
     trainer.total_training_steps=$total_training_steps \
     trainer.total_epochs=$total_epochs \
     trainer.default_local_dir=${OUTPUT} \
     trainer.validation_data_dir=${EVAL_LOG_PATH} \
-    trainer.rollout_data_dir=./run_logs/${experiment_name}/train_rollout \
+    trainer.rollout_data_dir=${SCRIPT_DIR}/run_logs/${experiment_name}/train_rollout \
     trainer.debug_validate_pipeline=false \
-    trainer.resume_mode=disable \
-    "$@" 2>&1 | tee ./logs/${project_name}_${experiment_name}.log
+    trainer.resume_mode=resume_path \
+    trainer.resume_from_path=${RESUME_CKPT} \
+    "$@" 2>&1 | tee "${SCRIPT_DIR}/logs/${project_name}_${experiment_name}.log"

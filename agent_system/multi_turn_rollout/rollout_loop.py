@@ -45,12 +45,20 @@ class TrajectoryCollector:
         self.config = config
         self.tokenizer = tokenizer
         self.processor = processor
+        # Prefill: text appended to the assistant prompt to guide generation start
+        # Prefer PREFILL_TEXT env var (avoids Hydra special-char parsing issues)
+        import os
+        self.prefill_text = os.environ.get('PREFILL_TEXT', '') or ''
+        if self.prefill_text:
+            self.prefill_text = self.prefill_text.replace('\\n', '\n')
+            print(f"[Prefill] First-turn prefill enabled: {self.prefill_text!r}")
 
     def preprocess_single_sample(
         self,
         item: int,
         gen_batch: DataProto,
         obs: Dict,
+        step: int = 0,
     ):
         """
         Process a single observation sample, organizing environment observations (text and/or images)
@@ -118,6 +126,10 @@ class TrajectoryCollector:
             tokenize=False,
             **apply_chat_template_kwargs,
         )
+
+        # Append prefill text on the first turn only to bypass safety refusals
+        if self.prefill_text and step == 0:
+            prompt_with_chat_template += self.prefill_text
 
         # Initialize return dict
         row_dict = {}
@@ -227,6 +239,7 @@ class TrajectoryCollector:
         self,
         gen_batch: DataProto,
         obs: Dict,
+        step: int = 0,
     ) -> DataProto:
         """
         Process a batch of observation samples, converting environment observations into model-processable format.
@@ -237,6 +250,7 @@ class TrajectoryCollector:
                 - 'text' (None or List[str]): Text observation data
                 - 'image' (np.ndarray or torch.Tensor): Image observation data
                 - 'anchor' (None or Any): Anchor observation without any histories or additional info. (for GiGPO only).
+            step (int): Current turn index (0-based). Used to apply prefill only on the first turn.
 
         Returns:
             DataProto: Contains processed batch data with preserved metadata
@@ -251,6 +265,7 @@ class TrajectoryCollector:
                 item=item,
                 gen_batch=gen_batch,
                 obs=obs,
+                step=step,
             )
             processed_samples.append(processed)
 
@@ -416,7 +431,7 @@ class TrajectoryCollector:
                 except Exception as e:
                     print(f"Print Error: {e}")
 
-            batch = self.preprocess_batch(gen_batch=gen_batch, obs=obs)
+            batch = self.preprocess_batch(gen_batch=gen_batch, obs=obs, step=_step)
 
             batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
             non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
@@ -451,6 +466,11 @@ class TrajectoryCollector:
             text_actions = self.tokenizer.batch_decode(
                 batch.batch["responses"], skip_special_tokens=True
             )
+
+            # Restore prefill on first turn: prepend prefill text to decoded responses
+            # so the full response (prefill + generated) is used for env step and logging
+            if self.prefill_text and _step == 0:
+                text_actions = [self.prefill_text + t for t in text_actions]
 
             # ===== Debug Print (Action) =====
             if getattr(self.config.trainer, 'debug_validate_pipeline', False):

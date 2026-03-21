@@ -70,6 +70,18 @@ train_batch_size=2
 val_data_size=2
 group_size=8
 lambda_div=0.0
+ADV_METHOD=${ADV_METHOD:-normdiscount}  # normdiscount | dcgrpo
+
+# Map ADV_METHOD to advantage estimator name
+if [ "$ADV_METHOD" = "normdiscount" ]; then
+    ADV_ESTIMATOR="multiturn_grpo"
+elif [ "$ADV_METHOD" = "dcgrpo" ]; then
+    ADV_ESTIMATOR="dc_grpo"
+else
+    echo "ERROR: Unknown ADV_METHOD=$ADV_METHOD. Use 'normdiscount' or 'dcgrpo'."
+    exit 1
+fi
+
 ppo_mini_batch_size=$((train_batch_size * group_size))
 steps_per_epoch=$((train_data_size / train_batch_size))
 total_epochs=8
@@ -122,6 +134,7 @@ echo " Target   : $TARGET_MODEL        (GPU $TARGET_GPU)"
 echo " Judge    : $JUDGE_MODEL         (GPU $JUDGE_GPU)"
 echo " Prompt   : $PROMPT_TYPE"
 echo " Max Turns: $MAX_TURNS"
+echo " Adv Method: $ADV_METHOD ($ADV_ESTIMATOR)"
 echo "=============================================="
 
 # ===========================================================
@@ -260,7 +273,7 @@ python3 -m verl.trainer.main_ppo --config-name=mtjailbreak \
     actor_rollout_ref.actor.checkpoint.contents='[model,optimizer,extra,hf_model]' \
     \
     `# === Algorithm ===` \
-    algorithm.adv_estimator=multiturn_grpo \
+    algorithm.adv_estimator=$ADV_ESTIMATOR \
     algorithm.gamma=0.9 \
     +algorithm.lambda_div=$lambda_div \
     algorithm.use_kl_in_reward=false \
